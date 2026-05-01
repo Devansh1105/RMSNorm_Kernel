@@ -68,6 +68,19 @@ except ModuleNotFoundError:
         from triton.language.math import rsqrt  # older fallback
 
 
+# DTensor support (tensor-parallel). The submodule needs an explicit import —
+# `torch.distributed.tensor` is not auto-loaded by `import torch.distributed`.
+# Some PyTorch builds also lack the submodule entirely; guard for both.
+try:
+    from torch.distributed.tensor import DTensor as _DTensor  # type: ignore
+except (ImportError, AttributeError):
+    _DTensor = None
+
+
+def _is_dtensor(x):
+    return _DTensor is not None and isinstance(x, _DTensor)
+
+
 # ---------------------------------------------------------------------------
 # Autotune configurations
 # ---------------------------------------------------------------------------
@@ -740,7 +753,7 @@ class FastRMSNormFunction(torch.autograd.Function):
         ctx, X, W, eps, offset=0.0, casting_mode="llama", in_place=True,
         row_mode=None, mode="auto", cache_rstd=True,
     ):
-        if isinstance(X, torch.distributed.tensor.DTensor):
+        if _is_dtensor(X):
             X = X.full_tensor()
 
         Y, X_flat, RSTD, BLOCK_SIZE, num_warps, casting_mode_int, resolved_mode = rms_norm_forward(
@@ -771,7 +784,7 @@ class FastRMSNormFunction(torch.autograd.Function):
             X, RSTD = ctx.saved_tensors
             W = None
 
-        if isinstance(dY, torch.distributed.tensor.DTensor):
+        if _is_dtensor(dY):
             dY = dY.full_tensor()
 
         # Backward never benefits from 'auto' — if we're here, requires_grad was True.

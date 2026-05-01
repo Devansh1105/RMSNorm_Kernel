@@ -105,6 +105,10 @@ def pick_reduce_strategy(sm_count: int, n_cols: int, device: torch.device) -> in
     """
     if device.type != "cuda":
         return REDUCE_STRATEGY_SCRATCH.value
-    l2 = torch.cuda.get_device_properties(device).l2_cache_size
+    props = torch.cuda.get_device_properties(device)
+    # PyTorch renamed l2_cache_size -> L2_cache_size at some point. Try both.
+    l2 = getattr(props, "L2_cache_size", None) or getattr(props, "l2_cache_size", None)
+    if l2 is None:
+        return REDUCE_STRATEGY_SCRATCH.value  # safe default if we can't introspect
     working_set = sm_count * n_cols * 4
     return REDUCE_STRATEGY_ATOMIC.value if working_set < 0.5 * l2 else REDUCE_STRATEGY_SCRATCH.value
