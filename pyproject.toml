@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-rmsnorm"
+version = "0.1.0.dev0"
+description = "A faster Triton RMSNorm kernel (fwd + bwd) with FlashNorm-style γ-fold for inference"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.1",
+    "triton>=2.3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+bench = [
+    "matplotlib",
+    "liger-kernel",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["fast_rmsnorm*"]

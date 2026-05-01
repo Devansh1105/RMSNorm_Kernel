@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / local tooling
+.idea/
+.vscode/
+.DS_Store
+.codex
+.claude/
+
+# Triton / CUDA caches and profiling output
+.triton/
+triton_cache/
+*.nsys-rep
+*.nsys.sqlite
+*.qdrep
+*.nvvp
+
+# Benchmark outputs
+benchmark/results/
+benchmark/*.csv
+benchmark/*.json
+benchmark/*.png
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
