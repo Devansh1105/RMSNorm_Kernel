@@ -11,10 +11,6 @@ import triton
 import triton.language as tl
 
 
-def is_hip() -> bool:
-    return torch.version.hip is not None
-
-
 def ensure_contiguous(fn):
     @functools.wraps(fn)
     def wrapper(ctx, *args, **kwargs):
@@ -28,11 +24,9 @@ def ensure_contiguous(fn):
     return wrapper
 
 
-MAX_FUSED_SIZE = 65536
-
-
 def calculate_settings(n: int):
     """Liger-style heuristic. Used in ``mode='infer'`` to skip autotune cold-start."""
+    MAX_FUSED_SIZE = 65536
     BLOCK_SIZE = triton.next_power_of_2(n)
     if BLOCK_SIZE > MAX_FUSED_SIZE:
         raise RuntimeError(
@@ -40,7 +34,7 @@ def calculate_settings(n: int):
         )
     num_warps = 4
     if BLOCK_SIZE >= 32768:
-        num_warps = 32 if not is_hip() else 16
+        num_warps = 16 if torch.version.hip is not None else 32
     elif BLOCK_SIZE >= 8192:
         num_warps = 16
     elif BLOCK_SIZE >= 2048:
@@ -55,7 +49,6 @@ torch_to_triton_dtype = {
 }
 
 
-# Casting modes mirror Liger's three-mode design.
 CASTING_NONE: tl.constexpr = tl.constexpr(-1)
 CASTING_LLAMA: tl.constexpr = tl.constexpr(0)
 CASTING_GEMMA: tl.constexpr = tl.constexpr(1)
@@ -83,17 +76,6 @@ REDUCE_STRATEGY_ATOMIC: tl.constexpr = tl.constexpr(1)   # tl.atomic_add into a 
 def dtype_id(dtype: torch.dtype) -> int:
     """Stable int per dtype — used in autotune key so configs differ by dtype."""
     return {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}[dtype]
-
-
-def m_bucket(M: int) -> int:
-    """Coarse log-bucket of M (for autotune key — avoid recompile-per-M)."""
-    if M < 1024:
-        return 0
-    if M < 16384:
-        return 1
-    if M < 131072:
-        return 2
-    return 3
 
 
 def pick_reduce_strategy(sm_count: int, n_cols: int, device: torch.device) -> int:

@@ -82,6 +82,10 @@ class _MiniLlama(nn.Module):
 def test_fold_preserves_output(dtype):
     h = 256
     model = _MiniLlama(h=h, vocab=128, num_layers=2).cuda().to(dtype).eval()
+    # .eval() only flips dropout/BN training flag; params still requires_grad.
+    # Folding is inference-only, so we explicitly clear it.
+    for p in model.parameters():
+        p.requires_grad_(False)
 
     with torch.no_grad():
         for m in model.modules():
