@@ -105,7 +105,7 @@ def _fold_pair(pair: FoldPair) -> None:
             "call model.eval() and ensure no grads are required."
         )
 
-    # offset + γ  (Gemma uses offset=1, Llama uses 0)
+    # offset + γ  (Gemma uses offset=1, Llama uses 0). Kept in fp32.
     scale = (norm.offset + norm.weight.detach()).to(torch.float32)
 
     for lin in pair.linears:
@@ -117,8 +117,11 @@ def _fold_pair(pair: FoldPair) -> None:
         if lin.weight.requires_grad:
             raise RuntimeError(f"{pair.name}: target Linear requires_grad=True; fold is inference-only.")
         # nn.Linear weight is (out_features, in_features); scale along in_features (dim=1).
+        # Do the multiply in fp32 and cast once on store, so we don't double-quantize
+        # (`scale.to(bf16) * W.bf16` would round twice).
         target_dtype = lin.weight.dtype
-        lin.weight.data.mul_(scale.to(target_dtype).unsqueeze(0))
+        new_w = lin.weight.data.to(torch.float32).mul_(scale.unsqueeze(0))
+        lin.weight.data.copy_(new_w.to(target_dtype))
 
     # Zero out γ (and the offset semantics) so the kernel's no-W path is correct.
     norm._gamma_folded = True

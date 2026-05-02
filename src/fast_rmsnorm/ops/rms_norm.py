@@ -109,8 +109,17 @@ _BACKWARD_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=32, num_stages=2),
 ]
 
-# Block-impl backward additionally tunes BLOCK_ROW (Liger hard-codes 16).
-# Useful for QK-norm (small N, huge M) where Liger leaves perf on the table.
+# Block-impl forward and backward additionally tune BLOCK_ROW (Liger hard-codes
+# 16). Useful for QK-norm (small N, huge M) where Liger leaves perf on the table.
+# Forward needs num_stages ∈ {1, 2} (less compute to hide loads behind);
+# backward goes up to {2, 3} since it has more loads to overlap.
+_BLOCK_FORWARD_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_ROW": br}, num_warps=nw, num_stages=ns)
+    for br in (4, 16, 32, 64)
+    for nw in (4, 8, 16)
+    for ns in (1, 2)
+]
+
 _BLOCK_BACKWARD_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_ROW": br}, num_warps=nw, num_stages=ns)
     for br in (4, 16, 32, 64)
@@ -161,7 +170,7 @@ def _rms_norm_forward_kernel(
     eps = eps.to(tl.float32)
     offset = offset.to(tl.float32)
 
-    # Casting modes — match Liger semantics exactly.
+    # Casting modes 
     if casting_mode == CASTING_LLAMA:
         # Llama: rstd computed in fp32; multiply by W done in input dtype.
         X_row = X_row.to(tl.float32)
@@ -508,7 +517,7 @@ _rms_norm_forward_kernel_at = triton.autotune(
 )(_rms_norm_forward_kernel)
 
 _block_rms_norm_forward_kernel_at = triton.autotune(
-    configs=_FORWARD_AUTOTUNE_CONFIGS,
+    configs=_BLOCK_FORWARD_AUTOTUNE_CONFIGS,
     key=["BLOCK_SIZE", "DTYPE_ID"],
 )(_block_rms_norm_forward_kernel)
 
@@ -602,26 +611,39 @@ def rms_norm_forward(X, W, eps, offset, casting_mode, *, mode="auto", row_mode=N
             **launch_kwargs,
         )
     else:
-        BLOCK_ROW = 16  # block-fwd doesn't autotune BLOCK_ROW (would need 2D autotune)
-        grid = (triton.cdiv(n_rows, BLOCK_ROW),)
-        kernel = _block_rms_norm_forward_kernel_at if resolved_mode == "train" else _block_rms_norm_forward_kernel
-        launch_kwargs = dict(
-            elementwise_affine=elementwise_affine,
-            STORE_RSTD=cache_rstd,
-            DTYPE_ID=dtype_key,
-            BLOCK_SIZE=BLOCK_SIZE,
-            BLOCK_ROW=BLOCK_ROW,
-        )
-        if resolved_mode == "infer":
-            launch_kwargs["num_warps"] = num_warps_heuristic
-        kernel[grid](
-            Y, Y.stride(0),
-            X, X.stride(0),
-            W, W.stride(0) if elementwise_affine else 0,
-            RSTD, rstd_stride,
-            n_rows, n_cols, eps, offset, casting_mode,
-            **launch_kwargs,
-        )
+        # Block-impl forward. In train mode, BLOCK_ROW is autotuned and the grid
+        # depends on the chosen BLOCK_ROW — pass a callable grid that reads
+        # BLOCK_ROW from the autotune meta. In infer mode, BLOCK_ROW=16 (Liger's
+        # heuristic) is fixed and the grid is a tuple.
+        if resolved_mode == "train":
+            _block_rms_norm_forward_kernel_at[
+                lambda meta: (triton.cdiv(n_rows, meta["BLOCK_ROW"]),)
+            ](
+                Y, Y.stride(0),
+                X, X.stride(0),
+                W, W.stride(0) if elementwise_affine else 0,
+                RSTD, rstd_stride,
+                n_rows, n_cols, eps, offset, casting_mode,
+                elementwise_affine=elementwise_affine,
+                STORE_RSTD=cache_rstd,
+                DTYPE_ID=dtype_key,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+        else:  # infer
+            BLOCK_ROW = 16
+            _block_rms_norm_forward_kernel[(triton.cdiv(n_rows, BLOCK_ROW),)](
+                Y, Y.stride(0),
+                X, X.stride(0),
+                W, W.stride(0) if elementwise_affine else 0,
+                RSTD, rstd_stride,
+                n_rows, n_cols, eps, offset, casting_mode,
+                elementwise_affine=elementwise_affine,
+                STORE_RSTD=cache_rstd,
+                DTYPE_ID=dtype_key,
+                BLOCK_SIZE=BLOCK_SIZE,
+                BLOCK_ROW=BLOCK_ROW,
+                num_warps=num_warps_heuristic,
+            )
 
     return Y.view(*shape), X, RSTD, BLOCK_SIZE, num_warps_heuristic, casting_mode, resolved_mode
 
