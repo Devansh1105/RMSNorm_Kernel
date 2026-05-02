@@ -574,9 +574,11 @@ def rms_norm_forward(X, W, eps, offset, casting_mode, *, mode="auto", row_mode=N
 
     Y = torch.empty((n_rows, n_cols), dtype=X.dtype, device=X.device)
 
-    # I3: when not caching rstd, allocate a 1-element placeholder so the kernel
-    # arg list is unchanged. The kernel branches on STORE_RSTD constexpr and
-    # never touches the placeholder when STORE_RSTD=False.
+    # I3: kernel signature requires a valid RSTD pointer either way. When
+    # caching, RSTD is the real M-element tensor we'll save for backward.
+    # When not caching, we allocate a 1-element placeholder that lives only
+    # for the duration of the kernel launch — it goes out of scope here and
+    # never enters the autograd graph (we return None for RSTD below).
     if cache_rstd:
         rstd_dtype = torch.float32 if casting_mode in (CASTING_LLAMA.value, CASTING_GEMMA.value) else X.dtype
         RSTD = torch.empty(n_rows, dtype=rstd_dtype, device=X.device)
@@ -645,7 +647,8 @@ def rms_norm_forward(X, W, eps, offset, casting_mode, *, mode="auto", row_mode=N
                 num_warps=num_warps_heuristic,
             )
 
-    return Y.view(*shape), X, RSTD, BLOCK_SIZE, num_warps_heuristic, casting_mode, resolved_mode
+    # Only export RSTD when actually cached. The placeholder (if any) is GC'd here.
+    return Y.view(*shape), X, (RSTD if cache_rstd else None), BLOCK_SIZE, num_warps_heuristic, casting_mode, resolved_mode
 
 
 def rms_norm_backward(
@@ -689,6 +692,16 @@ def rms_norm_backward(
     use_block = _use_block_impl(BLOCK_SIZE, n_rows, row_mode)
     dtype_key = dtype_id(X.dtype)
 
+    # I3: when not caching, RSTD comes in as None. Allocate a 1-element
+    # placeholder for the kernel signature; the kernel branches on
+    # RECOMPUTE_RSTD constexpr and never reads from it.
+    if RSTD is None:
+        rstd_arg = torch.empty(1, dtype=torch.float32, device=X.device)
+        rstd_stride = 0
+    else:
+        rstd_arg = RSTD
+        rstd_stride = RSTD.stride(0)
+
     if not use_block:
         kernel = _rms_norm_backward_kernel_at if mode == "train" else _rms_norm_backward_kernel
         launch_kwargs = dict(
@@ -706,7 +719,7 @@ def rms_norm_backward(
             X, X.stride(0),
             torch_to_triton_dtype[X.dtype],
             W, W.stride(0) if elementwise_affine else 0,
-            RSTD, RSTD.stride(0) if cache_rstd else 0,
+            rstd_arg, rstd_stride,
             _dW, dW_row_stride,
             n_rows, n_cols,
             eps, offset, rows_per_program, casting_mode,
@@ -730,7 +743,7 @@ def rms_norm_backward(
             X, X.stride(0),
             torch_to_triton_dtype[X.dtype],
             W, W.stride(0) if elementwise_affine else 0,
-            RSTD, RSTD.stride(0) if cache_rstd else 0,
+            rstd_arg, rstd_stride,
             _dW, dW_row_stride,
             n_rows, n_cols,
             eps, offset, casting_mode,
@@ -791,20 +804,31 @@ class FastRMSNormFunction(torch.autograd.Function):
         ctx.elementwise_affine = W is not None
         ctx.mode = resolved_mode
         ctx.cache_rstd = cache_rstd
-        if W is not None:
-            ctx.save_for_backward(X_flat, W, RSTD)
-        else:
-            ctx.save_for_backward(X_flat, RSTD)
+        # Only save what's real. When cache_rstd=False, RSTD is None — we
+        # don't want to leak a placeholder tensor through autograd. Backward
+        # allocates a fresh placeholder if needed for the kernel signature.
+        saved = (X_flat,) if W is None else (X_flat, W)
+        if cache_rstd:
+            saved = saved + (RSTD,)
+        ctx.save_for_backward(*saved)
         return Y
 
     @staticmethod
     @ensure_contiguous
     def backward(ctx, dY):
-        if ctx.elementwise_affine:
-            X, W, RSTD = ctx.saved_tensors
+        if ctx.cache_rstd:
+            if ctx.elementwise_affine:
+                X, W, RSTD = ctx.saved_tensors
+            else:
+                X, RSTD = ctx.saved_tensors
+                W = None
         else:
-            X, RSTD = ctx.saved_tensors
-            W = None
+            if ctx.elementwise_affine:
+                X, W = ctx.saved_tensors
+            else:
+                (X,) = ctx.saved_tensors
+                W = None
+            RSTD = None  # rms_norm_backward will allocate a placeholder for the kernel
 
         if _is_dtensor(dY):
             dY = dY.full_tensor()

@@ -128,6 +128,23 @@ needing more design work.
   numbers on Qwen3 QK-norm. If E1's `BLOCK_ROW` autotune already closes the gap,
   drop. If a measurable gap remains for the lm_head call (M tiny, latency-bound),
   add a `lmhead` specialization sharing source via constexpr branching.
+- **Grid-multiplier autotune for backward.** Currently `grid=(sm_count,)`
+  hard-coded for both row- and block-impl backward. Multiplying by 2 (so 2
+  programs per SM concurrent) buys latency hiding *but* costs ~1.5% extra
+  HBM traffic (more dW scratch / more atomics / extra final reduction).
+  **Two-condition gate before implementing:**
+    1. A100 bench shows `ours_train` bwd < 85% of peak HBM bandwidth (room
+       for latency hiding to clear the overhead).
+    2. Autotune is consistently picking max `num_warps=32` for that shape —
+       indicating warp-level parallelism inside one program is already
+       maxed and adding cross-program concurrency could help.
+  If either fails, skip — the win won't clear the overhead, and in the
+  saturated regime grid_mult=2 *regresses* perf. Prune to `grid_mult ∈ {1, 2}`
+  if we add it; 4× rarely wins and doubles cold-start.
+- **Default `cache_rstd=False`?** Recompute path is wired and tested, but
+  defaults to caching. Bench cache vs recompute on A100; if recompute is
+  within 2% of cache, flip the default — saves M fp32 scalars of HBM traffic
+  per layer per direction at essentially-free compute cost.
 - **E4 reinstated** — a real performance regression test once we have bandwidth
   numbers to threshold against.
 - **Persistent autotune cache to disk.** Triton's compile cache already

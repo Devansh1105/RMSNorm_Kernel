@@ -36,6 +36,19 @@ DTYPE_TOL = {
     torch.bfloat16: (5e-3, 5e-3),
 }
 
+# casting_mode='none' deliberately skips the fp32 ladder — sum-of-squares stays
+# in input dtype. A 4096-element bf16 reduction can drift by ~2⁻⁴ relative to a
+# fp32-accumulated reference. Users who pick 'none' opt into this precision cost.
+DTYPE_TOL_NONE = {
+    torch.float32: (1e-5, 1e-5),
+    torch.float16: (5e-2, 5e-2),
+    torch.bfloat16: (1e-1, 1e-1),
+}
+
+
+def _tol_for(dtype, casting_mode):
+    return DTYPE_TOL_NONE[dtype] if casting_mode == "none" else DTYPE_TOL[dtype]
+
 
 def _rand(shape, dtype, device="cuda"):
     return torch.randn(shape, dtype=dtype, device=device)
@@ -73,7 +86,7 @@ def test_forward(shape, dtype, casting_offset, with_weight):
     w = _rand((N,), dtype) if with_weight else None
     out = rms_norm(x.clone(), w, eps, offset=offset, casting_mode=casting_mode)
     out_ref = REF[casting_mode](x, w, eps, offset=offset)
-    atol, rtol = DTYPE_TOL[dtype]
+    atol, rtol = _tol_for(dtype, casting_mode)
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
 
 
