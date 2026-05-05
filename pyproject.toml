@@ -19,8 +19,12 @@ test = [
     "pytest",
 ]
 bench = [
+    "accelerate",
     "matplotlib",
     "liger-kernel",
+    "peft",
+    "transformers",
+    "unsloth",
 ]
 
 [tool.setuptools.packages.find]
