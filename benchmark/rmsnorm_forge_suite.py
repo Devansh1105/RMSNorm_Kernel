@@ -206,13 +206,18 @@ def _max_atol_rtol(torch, got, ref) -> tuple[float, float]:
     return diff.max().item(), (diff / denom).max().item()
 
 
+def _is_close(torch, got, ref, threshold: dict[str, float]) -> bool:
+    diff = (got - ref).abs().to(torch.float32)
+    limit = threshold["atol"] + threshold["rtol"] * ref.abs().to(torch.float32)
+    return bool(torch.all(diff <= limit).item())
+
+
 def _threshold_for(dtype) -> dict[str, float]:
     return THRESHOLDS[_dtype_name(dtype)]
 
 
-def _verdict(max_atol: float, max_rtol: float, dtype) -> str:
-    threshold = _threshold_for(dtype)
-    return "PASS" if max_atol <= threshold["atol"] and max_rtol <= threshold["rtol"] else "FAIL"
+def _verdict(passed: bool) -> str:
+    return "PASS" if passed else "FAIL"
 
 
 def _make_tensor(torch, shape: tuple[int, int], dtype, *, requires_grad: bool = False):
@@ -266,6 +271,7 @@ def _run_forward_correctness(torch, rms_norm, case: dict[str, Any]) -> dict[str,
     )
     ref = REFS[case["casting_mode"]](torch, x, w, DEFAULT_EPS, case["offset"])
     max_atol, max_rtol = _max_atol_rtol(torch, out, ref)
+    threshold = _threshold_for(dtype)
     return {
         "kind": "forward",
         "shape": [m, n],
@@ -275,8 +281,8 @@ def _run_forward_correctness(torch, rms_norm, case: dict[str, Any]) -> dict[str,
         "with_weight": case["with_weight"],
         "max_atol": max_atol,
         "max_rtol": max_rtol,
-        "threshold": _threshold_for(dtype),
-        "verdict": _verdict(max_atol, max_rtol, dtype),
+        "threshold": threshold,
+        "verdict": _verdict(_is_close(torch, out, ref, threshold)),
     }
 
 
@@ -306,8 +312,11 @@ def _run_backward_correctness(torch, rms_norm, case: dict[str, Any]) -> dict[str
     grads_ref = torch.autograd.grad(ref, ref_targets, grad.detach(), retain_graph=False)
 
     dx_atol, dx_rtol = _max_atol_rtol(torch, grads[0], grads_ref[0])
+    threshold = _threshold_for(dtype)
+    passed = _is_close(torch, grads[0], grads_ref[0], threshold)
     if w is not None:
         dw_atol, dw_rtol = _max_atol_rtol(torch, grads[1], grads_ref[1])
+        passed = passed and _is_close(torch, grads[1], grads_ref[1], threshold)
     else:
         dw_atol, dw_rtol = 0.0, 0.0
     max_atol = max(dx_atol, dw_atol)
@@ -325,8 +334,8 @@ def _run_backward_correctness(torch, rms_norm, case: dict[str, Any]) -> dict[str
         "dx_max_rtol": dx_rtol,
         "dw_max_atol": dw_atol,
         "dw_max_rtol": dw_rtol,
-        "threshold": _threshold_for(dtype),
-        "verdict": _verdict(max_atol, max_rtol, dtype),
+        "threshold": threshold,
+        "verdict": _verdict(passed),
     }
 
 
@@ -350,6 +359,12 @@ def _run_cache_mode_correctness(torch, rms_norm, quick: bool) -> list[dict[str, 
             y_atol, y_rtol = _max_atol_rtol(torch, y_b, y_a)
             dx_atol, dx_rtol = _max_atol_rtol(torch, dx_b, dx_a)
             dw_atol, dw_rtol = _max_atol_rtol(torch, dw_b, dw_a)
+            threshold = _threshold_for(dtype)
+            passed = (
+                _is_close(torch, y_b, y_a, threshold)
+                and _is_close(torch, dx_b, dx_a, threshold)
+                and _is_close(torch, dw_b, dw_a, threshold)
+            )
             max_atol = max(y_atol, dx_atol, dw_atol)
             max_rtol = max(y_rtol, dx_rtol, dw_rtol)
             out.append(
@@ -359,8 +374,8 @@ def _run_cache_mode_correctness(torch, rms_norm, quick: bool) -> list[dict[str, 
                     "dtype": _dtype_name(dtype),
                     "max_atol": max_atol,
                     "max_rtol": max_rtol,
-                    "threshold": _threshold_for(dtype),
-                    "verdict": _verdict(max_atol, max_rtol, dtype),
+                    "threshold": threshold,
+                    "verdict": _verdict(passed),
                 }
             )
     return out
@@ -448,7 +463,7 @@ def _run_fold_correctness(torch, quick: bool) -> list[dict[str, Any]]:
             after = model(x)
         max_atol, max_rtol = _max_atol_rtol(torch, after, before)
         threshold = {"atol": 1e-5, "rtol": 1e-5} if dtype == torch.float32 else {"atol": 2e-2, "rtol": 2e-2}
-        verdict = "PASS" if max_atol <= threshold["atol"] and max_rtol <= threshold["rtol"] else "FAIL"
+        verdict = _verdict(_is_close(torch, after, before, threshold))
         out.append(
             {
                 "kind": "fold_equivalence",
@@ -493,7 +508,7 @@ def _run_fold_correctness(torch, quick: bool) -> list[dict[str, Any]]:
             "max_atol": max_atol,
             "max_rtol": max_rtol,
             "threshold": {"atol": 2e-2, "rtol": 2e-2},
-            "verdict": "PASS" if max_atol <= 2e-2 and max_rtol <= 2e-2 else "FAIL",
+            "verdict": _verdict(_is_close(torch, after, before, {"atol": 2e-2, "rtol": 2e-2})),
         }
     )
     return out
@@ -1164,7 +1179,10 @@ def _correctness_summary(results: dict[str, Any]) -> str:
         for item in results["failures"][:20]:
             lines.append(
                 f"- {item['kind']} shape={item.get('shape')} dtype={item.get('dtype')} "
-                f"atol={item.get('max_atol')} rtol={item.get('max_rtol')}"
+                f"casting={item.get('casting_mode')} offset={item.get('offset')} "
+                f"with_weight={item.get('with_weight')} atol={item.get('max_atol')} "
+                f"rtol={item.get('max_rtol')} dx_atol={item.get('dx_max_atol')} "
+                f"dw_atol={item.get('dw_max_atol')}"
             )
     for item in results["results"]:
         if item.get("verdict") == "BLOCKED":

@@ -524,12 +524,28 @@ _block_rms_norm_forward_kernel_at = triton.autotune(
 _rms_norm_backward_kernel_at = triton.autotune(
     configs=_BACKWARD_AUTOTUNE_CONFIGS,
     key=["BLOCK_SIZE", "DTYPE_ID"],
+    reset_to_zero=["dW_ptr"],
+)(_rms_norm_backward_kernel)
+
+_rms_norm_backward_kernel_at_inplace = triton.autotune(
+    configs=_BACKWARD_AUTOTUNE_CONFIGS,
+    key=["BLOCK_SIZE", "DTYPE_ID"],
+    reset_to_zero=["dW_ptr"],
+    restore_value=["dY_ptr"],
 )(_rms_norm_backward_kernel)
 
 # Block backward gets BLOCK_ROW autotuned too — this is where QK-norm wins live.
 _block_rms_norm_backward_kernel_at = triton.autotune(
     configs=_BLOCK_BACKWARD_AUTOTUNE_CONFIGS,
     key=["BLOCK_SIZE", "DTYPE_ID"],
+    reset_to_zero=["dW_ptr"],
+)(_block_rms_norm_backward_kernel)
+
+_block_rms_norm_backward_kernel_at_inplace = triton.autotune(
+    configs=_BLOCK_BACKWARD_AUTOTUNE_CONFIGS,
+    key=["BLOCK_SIZE", "DTYPE_ID"],
+    reset_to_zero=["dW_ptr"],
+    restore_value=["dY_ptr"],
 )(_block_rms_norm_backward_kernel)
 
 
@@ -682,7 +698,10 @@ def rms_norm_backward(
             _dW = torch.empty((sm_count, n_cols), dtype=torch.float32, device=W.device)
             dW_row_stride = _dW.stride(0)
     else:
-        _dW = None
+        # Backward autotune resets dW_ptr between candidate configs. Keep a
+        # valid placeholder even when the kernel's elementwise_affine=False
+        # branch never reads or writes it.
+        _dW = torch.empty(1, dtype=torch.float32, device=X.device)
         dW_row_stride = 0
         reduce_strategy = REDUCE_STRATEGY_SCRATCH.value  # unused
 
@@ -703,7 +722,10 @@ def rms_norm_backward(
         rstd_stride = RSTD.stride(0)
 
     if not use_block:
-        kernel = _rms_norm_backward_kernel_at if mode == "train" else _rms_norm_backward_kernel
+        if mode == "train":
+            kernel = _rms_norm_backward_kernel_at_inplace if in_place else _rms_norm_backward_kernel_at
+        else:
+            kernel = _rms_norm_backward_kernel
         launch_kwargs = dict(
             elementwise_affine=elementwise_affine,
             REDUCE_STRATEGY=reduce_strategy,
@@ -726,7 +748,10 @@ def rms_norm_backward(
             **launch_kwargs,
         )
     else:
-        kernel = _block_rms_norm_backward_kernel_at if mode == "train" else _block_rms_norm_backward_kernel
+        if mode == "train":
+            kernel = _block_rms_norm_backward_kernel_at_inplace if in_place else _block_rms_norm_backward_kernel_at
+        else:
+            kernel = _block_rms_norm_backward_kernel
         launch_kwargs = dict(
             elementwise_affine=elementwise_affine,
             REDUCE_STRATEGY=reduce_strategy,
