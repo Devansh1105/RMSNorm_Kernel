@@ -3,8 +3,8 @@
 A Triton RMSNorm kernel with forward, backward, and an inference-only
 FlashNorm-style gamma-fold path.
 
-Status: v1 kernel code is present. The old pytest tests and prototype benchmark
-have been replaced by a Forge-style benchmark suite under `benchmark/`.
+Status: v1 kernel code is present. The active benchmark work is now phased and
+modular. Phase 1 is a correctness gate under `benchmark/scripts/`.
 
 ## Install
 
@@ -58,7 +58,10 @@ src/fast_rmsnorm/
     folding.py           # inference-only gamma folding utility
 
 benchmark/
-  rmsnorm_forge_suite.py # correctness + Forge Part A isolation suite
+  common/                # shared environment, tolerance, and table helpers
+  correctness/           # Phase 1 correctness cases and checks
+  scripts/
+    check_correctness.py # Colab-sized correctness gate
   README.md              # Colab and RunPod runbook
 
 refs/liger-kernel/       # reference Liger source
@@ -71,26 +74,18 @@ Use a CUDA GPU runtime. Triton does not run on Colab TPU.
 Initial Colab correctness gate:
 
 ```bash
-python -m benchmark.rmsnorm_forge_suite correctness --quick
+python -m benchmark.scripts.check_correctness
 ```
 
-Quick Colab isolation smoke:
+Broader pre-benchmark correctness matrix:
 
 ```bash
-python -m benchmark.rmsnorm_forge_suite isolation --quick
+python -m benchmark.scripts.check_correctness --full
 ```
 
-The benchmark dtype defaults to `auto`: bf16 when supported, otherwise fp16 for
-T4-style smoke runs.
-
-Full RunPod/A100 isolation report:
-
-```bash
-python -m benchmark.rmsnorm_forge_suite isolation --full --strict-competitors
-```
-
-The suite writes JSON and markdown reports under `benchmark/results/`. See
-[benchmark/README.md](benchmark/README.md) for the full runbook.
+The Phase 1 gate prints formatted tables only. It does not write JSON and does
+not run timings. Isolation and model-level benchmarks are later phases; see
+[benchmark/README.md](benchmark/README.md) and [PROJECT_PLAN.md](PROJECT_PLAN.md).
 
 ## Implemented v1 Deltas
 
@@ -106,7 +101,7 @@ The suite writes JSON and markdown reports under `benchmark/results/`. See
 
 - Feature dimensions above Triton's fused block limit raise; streaming fallback is future work.
 - Forge fp64 `gradcheck` is reported as blocked because the current kernel dtype map supports fp32/fp16/bf16 only.
-- Model-level Forge Part B benchmarking is planned as Phase 2.
+- Isolation timing and model-level Forge Part B benchmarking are planned as later phases.
 - Gamma folding supports plain `nn.Linear` targets only; quantized linears are out of scope for v1.
 - Persistent autotune-choice caching is not implemented yet.
 

@@ -1,145 +1,67 @@
-# RMSNorm Forge Benchmark Suite
+# RMSNorm Benchmark Plan
 
-This directory contains the unified correctness and isolation benchmark flow for
-`fast_rmsnorm`. The first gate is designed for Colab GPU so kernel bugs are
-caught before spending money on RunPod/A100. The full RunPod pass produces the
-Forge Part A report.
+This directory contains the phased benchmark and verification workflow for
+`fast_rmsnorm`. Phase 1 is deliberately small: it only checks correctness and
+prints readable tables. It does not write JSON, run timings, or generate a final
+Forge report.
 
-Phase 1 is implemented:
+## Phase 1: Correctness Gate
 
-- correctness vs PyTorch reference formulas
-- isolation sweeps for sequence length, batch size, and hidden dimension
-- CUDA event timing with warmups and L2 flushing
-- mean, median, p50, p95, p99, std, min, max
-- VRAM, arithmetic intensity, peak utilization, and roofline classification
-- markdown report generation
-
-Phase 2 is not implemented yet:
-
-- HuggingFace model-level B1-B3 benchmarking
-- LoRA SFT step timing
-- convergence/loss-curve comparison
-
-## Prerequisites
-
-Use a CUDA GPU runtime. Triton kernels do not run on Colab TPU.
-
-```bash
-git clone <this-repo-url>
-cd rmsnorm
-pip install -e .[bench]
-```
-
-If `unsloth` does not install cleanly in the environment, run the quick checks
-without strict competitors first. The suite will print a `NOT_RUN`/install
-message for missing competitors instead of silently omitting them. The final
-RunPod report should use `--strict-competitors`.
-
-## 1. Colab Correctness Gate
-
-Run this first on a free Colab GPU, typically T4:
-
-```bash
-python -m benchmark.rmsnorm_forge_suite correctness --quick
-```
-
-Expected result:
-
-```text
-Correctness PASS: ... checks, 0 failures, 1 blocked.
-Blocked: gradcheck_fp64 - Forge asks for torch.autograd.gradcheck in fp64...
-```
-
-The blocked gradcheck row is intentional for v1. The current Triton dispatcher
-only maps fp32/fp16/bf16, so Forge's fp64 gradcheck requirement cannot honestly
-be marked PASS until fp64 support or a dedicated fp64 test wrapper is added.
-
-Do not continue to paid benchmarking if this command reports any `FAIL`.
-
-## 2. Colab Quick Isolation Smoke
-
-After correctness passes:
-
-```bash
-python -m benchmark.rmsnorm_forge_suite isolation --quick
-```
-
-This runs a tiny sequence, batch, hidden, and reference sweep. It writes:
-
-```text
-benchmark/results/isolation_<gpu>_<timestamp>.json
-benchmark/results/isolation_<gpu>_<timestamp>.md
-```
-
-Missing Liger or Unsloth imports are shown in the report as `NOT_RUN` with an
-install or adapter note.
-
-The benchmark dtype defaults to `auto`: bf16 when the GPU supports it, otherwise
-fp16. This keeps T4 smoke runs usable while full A100/H100 runs still use bf16.
-
-## 3. RunPod Full Isolation Report
-
-Use an A100/H100 CUDA image with this repo installed:
+Run this first on a CUDA GPU runtime, ideally a free Colab T4/L4 before spending
+time on A100/H100 benchmarking.
 
 ```bash
 pip install -e .[bench]
-python -m benchmark.rmsnorm_forge_suite isolation --full --strict-competitors
+python -m benchmark.scripts.check_correctness
 ```
 
-This is the Forge Part A report run. It requires all direct competitors to be
-importable. If Unsloth is installed but no direct RMSNorm adapter is exposed by
-that version, the suite fails with a clear message rather than producing an
-incomplete competitor table.
-
-Default timing settings match the Forge rules:
-
-- 3 warmup runs
-- 10 timed runs
-- CUDA event timing
-- L2 flush before every timed run
-
-Override only for debugging:
+Before a full isolation benchmark, run the broader matrix:
 
 ```bash
-python -m benchmark.rmsnorm_forge_suite isolation --full --warmup 1 --runs 3
-python -m benchmark.rmsnorm_forge_suite isolation --quick --no-flush-l2
+python -m benchmark.scripts.check_correctness --full
 ```
 
-Runs with `--no-flush-l2` are not Forge-compliant.
+The output is split into tables:
 
-## 4. Regenerate A Report
+- `Environment`: GPU, CUDA/HIP, Torch, Triton, and bf16 support.
+- `Summary`: total PASS/FAIL/BLOCKED counts.
+- `Forward Correctness`: Forge output vs explicit PyTorch formulas.
+- `Backward Correctness`: `dx` and `dweight` vs PyTorch autograd.
+- `Path And Option Checks`: `cache_rstd`, `in_place`, `mode`, row path, and block path coverage.
+- `Gamma Fold Checks`: pre-fold vs post-fold model outputs and refusal cases.
+- `Blocked Checks`: Forge-required checks that cannot honestly pass yet.
 
-Reports are deterministic from the JSON payload:
+The script prints PASS/FAIL/BLOCKED rows and exits normally after printing the
+tables. Treat any `FAIL` row as a stop sign before benchmarking.
 
-```bash
-python -m benchmark.rmsnorm_forge_suite report \
-  --input benchmark/results/isolation_<gpu>_<timestamp>.json
-```
+Expected v1 result:
 
-This rewrites the sibling `.md` report.
+- `FAIL` should be zero before any benchmarking.
+- `gradcheck_fp64` is expected to be `BLOCKED` because the Triton dispatcher
+  currently supports fp32/fp16/bf16, not fp64.
+- `reduce_strategy_direct` is expected to be `BLOCKED` until the public API has
+  a debug flag to force atomic vs scratch dweight reduction. The automatic path
+  is still exercised indirectly through the row/block correctness cases.
 
-## 5. Reading The Report
+## What Phase 1 Covers
 
-- A1: forward latency across sequence length.
-- A2: estimated backward latency. The suite measures forward+backward and
-  reports backward as `Fwd+Bwd - Fwd`, so compare this consistently across
-  frameworks.
-- A3: combined forward+backward latency.
-- A4: full timing distribution for the reference configuration.
-- A5/A6: scaling with batch size and hidden dimension.
-- A7: peak CUDA memory allocated.
-- A8: arithmetic intensity, roofline classification, peak utilization, and
-  correctness rows.
-- Kernel Report Card: quick decision table for correctness, speedup, hardware
-  utilization, and missing Phase 2 items.
+- Llama, Gemma, and no-cast reference formulas.
+- Affine and non-affine RMSNorm.
+- fp32 plus available low-precision dtype. On bf16-capable GPUs this includes
+  bf16; on T4 it uses fp16.
+- Row-per-program kernel path.
+- Block kernel path for many rows and small hidden dimension.
+- Forward-only inference mode.
+- Backward train mode.
+- `mode="train"`, `mode="infer"`, and `mode="auto"`.
+- `cache_rstd=True` vs `cache_rstd=False`.
+- `in_place=True` vs `in_place=False`.
+- Gamma folding equivalence for Llama-like and Gemma-offset models.
+- Gamma folding refusal for trainable params, non-Linear targets, and double fold.
 
-## 6. Troubleshooting
+## Troubleshooting
 
-`CUDA GPU is required`
-
-You are on CPU or TPU. Switch Colab runtime to GPU.
-
-`PyTorch is not installed`
+`Correctness runner error: PyTorch is not installed`
 
 Run:
 
@@ -147,37 +69,31 @@ Run:
 pip install -e .[bench]
 ```
 
-`Missing required competitors under --strict-competitors`
+`Correctness runner error: CUDA GPU is required`
 
-Install the named dependency. For Liger:
+Switch the runtime to a CUDA GPU. CPU and Colab TPU cannot run Triton kernels.
 
-```bash
-pip install liger-kernel
-```
+`FAIL` rows in backward
 
-For Unsloth:
+Do not benchmark yet. The failure table shows the path, shape, dtype, reference,
+and compared path. Start with the smallest failing shape and rerun after fixing
+the kernel or tolerance bug.
 
-```bash
-pip install unsloth
-```
+`BLOCKED` rows
 
-If Unsloth imports but does not expose a direct RMSNorm adapter, record that in
-the report notes and compare Unsloth at model-level in Phase 2.
+Blocked rows are not silently ignored. They document Forge requirements that are
+not implemented yet. For v1, fp64 gradcheck and forced reduce-strategy comparison
+are known blocked items.
 
-`Correctness failed; refusing to benchmark`
+## Later Phases
 
-Run:
+Phase 2 will add isolation timing scripts: CUDA events, warmups, L2 flush,
+sequence/batch/hidden sweeps, competitor adapters, VRAM, roofline-style metrics,
+and markdown/JSON outputs.
 
-```bash
-python -m benchmark.rmsnorm_forge_suite correctness --quick --output /tmp/rmsnorm_correctness.json
-```
+Phase 3 will add model-level benchmarking: HuggingFace patching, LoRA SFT step
+time, convergence/loss checks, and model-level comparisons against PyTorch,
+Liger, and Unsloth.
 
-Inspect the failing rows before starting RunPod.
-
-## 7. Not Covered Yet
-
-- Forge Part B model-level training benchmark.
-- 1000-step convergence/loss-curve check.
-- C++/CUDA Apex-style competitor column.
-- AMD/ROCm benchmarking.
-- Persistent autotune-choice cache validation.
+Phase 4 will add report generation and runbook polish once the timing and
+model-level scripts exist.
