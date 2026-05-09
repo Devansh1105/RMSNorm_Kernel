@@ -1,6 +1,8 @@
-"""Small models for gamma-fold correctness checks."""
-"Gemma-style RMSNorm folding into fp16/bf16 nn.Linear weights refused due to precision issues"
+"""Small models for gamma-fold correctness checks.
 
+Gemma-style RMSNorm folding into fp16/bf16 nn.Linear weights is refused by
+default because it changes rounding order.
+"""
 
 from __future__ import annotations
 
