@@ -53,6 +53,7 @@ def _print_forward(rows: list[dict]) -> None:
             "Shape",
             "Dtype",
             "Casting",
+            "Offset",
             "Weight",
             "Mode",
             "Reference",
@@ -68,6 +69,7 @@ def _print_forward(rows: list[dict]) -> None:
                 _value(row, "shape"),
                 _value(row, "dtype"),
                 _value(row, "casting"),
+                _value(row, "offset"),
                 _value(row, "weight"),
                 _value(row, "mode"),
                 _value(row, "reference"),
@@ -90,6 +92,7 @@ def _print_backward(rows: list[dict]) -> None:
             "Shape",
             "Dtype",
             "Casting",
+            "Offset",
             "Weight",
             "In-place",
             "Cache rstd",
@@ -109,6 +112,7 @@ def _print_backward(rows: list[dict]) -> None:
                 _value(row, "shape"),
                 _value(row, "dtype"),
                 _value(row, "casting"),
+                _value(row, "offset"),
                 _value(row, "weight"),
                 _value(row, "in_place"),
                 _value(row, "cache_rstd"),
@@ -135,6 +139,8 @@ def _print_internal(rows: list[dict]) -> None:
             "Path",
             "Shape",
             "Dtype",
+            "Casting",
+            "Offset",
             "Reference",
             "Compared",
             "Max Abs",
@@ -151,6 +157,8 @@ def _print_internal(rows: list[dict]) -> None:
                 _value(row, "path"),
                 _value(row, "shape"),
                 _value(row, "dtype"),
+                _value(row, "casting"),
+                _value(row, "offset"),
                 _value(row, "reference"),
                 _value(row, "compared"),
                 _metric(row, "max_abs"),
@@ -222,7 +230,7 @@ def _print_failures(rows: list[dict]) -> None:
         return
     print_section("Failures")
     print_table(
-        ["Group", "Check", "Path", "Shape", "Dtype", "Reference", "Compared", "Max Abs", "Max Rel", "Notes"],
+        ["Group", "Check", "Path", "Shape", "Dtype", "Casting", "Offset", "Reference", "Compared", "Max Abs", "Max Rel", "Notes"],
         [
             [
                 _value(row, "group"),
@@ -230,6 +238,8 @@ def _print_failures(rows: list[dict]) -> None:
                 _value(row, "path"),
                 _value(row, "shape"),
                 _value(row, "dtype"),
+                _value(row, "casting"),
+                _value(row, "offset"),
                 _value(row, "reference"),
                 _value(row, "compared"),
                 _metric(row, "max_abs"),

@@ -11,8 +11,11 @@ kernel versions. Update it after every GPU run and before changing v1.5/v2 scope
 - Package: `fast_rmsnorm`
 - Main kernel file: `src/fast_rmsnorm/ops/rms_norm.py`
 - Main module wrapper: `src/fast_rmsnorm/transformers/rms_norm.py`
-- Active Phase 1 benchmark entry point:
+- Active Phase 1 correctness entry point:
   `python -m benchmark.scripts.check_correctness`
+- Active Phase 2 isolation timing entry points:
+  `python -m benchmark.scripts.bench_isolation --quick`
+  `python -m benchmark.scripts.bench_isolation --full`
 - Goal: standalone Triton RMSNorm forward + backward that matches or beats Liger
   on realistic LLM shapes, plus inference-time gamma folding.
 - Later goal: add fused variants only where measurement shows value, including
@@ -29,7 +32,7 @@ kernel versions. Update it after every GPU run and before changing v1.5/v2 scope
 - [x] Phase 1 correctness gate implemented as modular files.
 - [ ] Phase 1 correctness gate run on Colab GPU after this rewrite.
 - [ ] Phase 1 full correctness matrix run on A100/H100.
-- [ ] Phase 2 isolation benchmark implemented.
+- [x] Phase 2 isolation benchmark implemented.
 - [ ] Phase 3 model-level benchmark implemented.
 - [ ] v1 benchmark results copied into this plan.
 - [ ] v1.5 scope finalized from actual benchmark results.
@@ -42,8 +45,8 @@ Fill this table after runs finish.
 |---|---|---|---|---|
 | Colab correctness | TBD | `python -m benchmark.scripts.check_correctness` | Pending | Expected: no FAIL; fp64 gradcheck may be BLOCKED |
 | Full correctness | TBD | `python -m benchmark.scripts.check_correctness --full` | Pending | Run before paid isolation benchmark |
-| Isolation quick | TBD | TBD | Pending | Phase 2 |
-| Isolation full | TBD | TBD | Pending | Phase 2, A100/H100 |
+| Isolation quick | TBD | `python -m benchmark.scripts.bench_isolation --quick` | Pending | Phase 2 timing smoke; run after separate correctness check |
+| Isolation full | TBD | `python -m benchmark.scripts.bench_isolation --full` | Pending | Phase 2 timing, A100/H100; run after separate full correctness check |
 | Model-level | TBD | TBD | Pending | Phase 3 |
 
 ## v1 Kernel Checklist
@@ -177,39 +180,67 @@ Phase 1 validation still required:
 
 ### Phase 2: Isolation Timing Benchmark
 
-Purpose: implement Forge Part A timing after Phase 1 has no FAIL rows.
+Purpose: timing-only Forge Part A isolation benchmark. Correctness remains a
+separate Phase 1 workflow and is not run or enforced by Phase 2.
 
-Planned files:
+Implemented files:
 
-- [ ] `benchmark/timing/events.py`
-  - CUDA event timing
+- [x] `benchmark/timing/events.py`
+  - CUDA event timing only
   - warmup runs
   - timed runs
   - L2 flush before timed runs
+  - CUDA synchronization before and after each timed sample
   - mean, median, p50, p95, p99, std, min, max
-- [ ] `benchmark/timing/configs.py`
-  - sequence-length sweep
-  - batch-size sweep
-  - hidden-dimension sweep
-  - reference config
-  - GPU peak bandwidth/FLOPS table
-- [ ] `benchmark/timing/competitors.py`
-  - PyTorch formula adapter
-  - Liger adapter
-  - Unsloth adapter or explicit not-run reason
-  - Forge adapter
-- [ ] `benchmark/scripts/bench_isolation.py`
-  - simple CLI
-  - calls Phase 1 correctness first or requires a `--skip-correctness` debug flag
-  - prints formatted timing tables
-  - writes JSON only in this phase, not in Phase 1
-- [ ] `benchmark/timing/reporting.py`
-  - A1/A2/A3 sequence tables
-  - A4 timing distribution
-  - A5 batch table
-  - A6 hidden table
-  - A7 VRAM table
-  - A8 profiling/correctness summary
+- [x] `benchmark/timing/configs.py`
+  - quick reference and QK-norm configs
+  - full reference, sequence, batch, hidden, and QK-norm sweeps
+  - dtype policy: fp16 below compute capability 8.0, bf16 at 8.0+
+  - GPU peak bandwidth/FLOPS table for T4, L4, A100, and H100
+- [x] `benchmark/timing/competitors.py`
+  - PyTorch explicit-formula adapter
+  - Forge adapter using `fast_rmsnorm.transformers.rms_norm`
+  - Liger adapter using `liger_kernel.ops.LigerRMSNormFunction`
+  - Unsloth direct adapter or explicit `NOT_RUN` reason
+- [x] `benchmark/timing/profiling.py`
+  - estimated FLOPs
+  - estimated bytes moved
+  - arithmetic intensity
+  - achieved GB/s
+  - peak utilization percentage where peak data is known
+  - roofline label
+- [x] `benchmark/timing/reporting.py`
+  - Environment
+  - Run Settings
+  - Competitor Availability
+  - Reference Config
+  - Sequence Sweep
+  - Batch Sweep
+  - Hidden Sweep
+  - QK-Norm Sweep
+  - VRAM
+  - Profiling
+  - Warnings
+- [x] `benchmark/scripts/bench_isolation.py`
+  - simple CLI with only `--quick` and `--full`
+  - no correctness invocation or correctness gating
+  - prints a reminder to run Phase 1 separately
+  - deterministic seeded inputs built outside timed regions
+  - records forward, forward+backward, and derived backward rows
+  - records `NOT_RUN` rows for missing optional competitors
+  - continues through per-row errors
+  - writes JSON and markdown to `benchmark/results/`
+
+Phase 2 validation still required:
+
+- [x] Run `python -m compileall benchmark src` locally.
+- [x] Run `python -m benchmark.scripts.bench_isolation --help` locally.
+- [ ] Run `python -m benchmark.scripts.check_correctness` on Colab GPU.
+- [ ] Run `python -m benchmark.scripts.bench_isolation --quick` on Colab GPU.
+- [ ] Run `python -m benchmark.scripts.check_correctness --full` on A100/H100.
+- [ ] Run `python -m benchmark.scripts.bench_isolation --full` on A100/H100.
+- [ ] Copy generated JSON/markdown result filenames and summary numbers into
+  this plan.
 
 ### Phase 3: Model-Level Benchmark
 

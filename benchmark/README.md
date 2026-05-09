@@ -2,8 +2,8 @@
 
 This directory contains the phased benchmark and verification workflow for
 `fast_rmsnorm`. Phase 1 is deliberately small: it only checks correctness and
-prints readable tables. It does not write JSON, run timings, or generate a final
-Forge report.
+prints readable tables. Phase 2 is timing-only isolation benchmarking and writes
+JSON/markdown result files. Correctness and timing stay separate.
 
 ## Phase 1: Correctness Gate
 
@@ -44,6 +44,35 @@ Expected v1 result:
 - `reduce_strategy_direct` is expected to be `BLOCKED` until the public API has
   a debug flag to force atomic vs scratch dweight reduction. The automatic path
   is still exercised indirectly through the row/block correctness cases.
+
+## Phase 2: Isolation Timing
+
+Run Phase 1 separately before trusting timing numbers. Phase 2 does not call or
+enforce correctness.
+
+```bash
+python -m benchmark.scripts.bench_isolation --quick
+python -m benchmark.scripts.bench_isolation --full
+```
+
+`--quick` is the Colab/T4 smoke timing path. `--full` runs the reference,
+sequence, batch, hidden, and QK-norm timing sweeps intended for A100/H100.
+
+Phase 2 output includes:
+
+- Environment and run settings.
+- Competitor availability for PyTorch, Forge, Liger, and Unsloth.
+- Forward, forward+backward, and derived backward timing rows.
+- Peak VRAM per row.
+- Estimated FLOPs, bytes moved, GB/s, utilization, and roofline labels.
+- Non-fatal warnings.
+
+Results are written under `benchmark/results/`:
+
+```text
+isolation_<gpu>_<timestamp>.json
+isolation_<gpu>_<timestamp>.md
+```
 
 ## What Phase 1 Covers
 
@@ -89,10 +118,6 @@ not implemented yet. For v1, fp64 gradcheck and forced reduce-strategy compariso
 are known blocked items.
 
 ## Later Phases
-
-Phase 2 will add isolation timing scripts: CUDA events, warmups, L2 flush,
-sequence/batch/hidden sweeps, competitor adapters, VRAM, roofline-style metrics,
-and markdown/JSON outputs.
 
 Phase 3 will add model-level benchmarking: HuggingFace patching, LoRA SFT step
 time, convergence/loss checks, and model-level comparisons against PyTorch,

@@ -33,6 +33,7 @@ def _base_row(case: dict, *, group: str, check: str, reference: str, compared: s
         "shape": _shape_text(case["shape"]),
         "dtype": dtype_name(case["dtype"]),
         "casting": case.get("casting_mode", "-"),
+        "offset": case.get("offset", "-"),
         "weight": _weight_text(case.get("with_weight", False)),
         "mode": case.get("mode", "-"),
         "in_place": str(case.get("in_place", "-")),
