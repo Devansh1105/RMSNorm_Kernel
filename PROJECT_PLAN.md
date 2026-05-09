@@ -67,6 +67,8 @@ Fill this table after runs finish.
 - [x] fp32 epsilon pinning inside Triton kernels.
 - [x] `cache_rstd` flag.
 - [x] Inference-only gamma folding.
+- [x] Gemma fp16/bf16 gamma folding refuses by default; approximate fold requires
+  explicit opt-in.
 - [x] Backward autotune split for in-place vs non-in-place paths so autotune
   reset/restore overhead is not paid by the non-in-place path.
 
@@ -74,7 +76,8 @@ Fill this table after runs finish.
 
 - [ ] Colab T4/L4 correctness for forward and backward.
 - [ ] Full A100/H100 correctness matrix.
-- [ ] Gamma folding equivalence on Llama-like and Gemma-offset paths.
+- [ ] Gamma folding equivalence on Llama-like and Gemma-offset fp32 paths.
+- [ ] Gemma fp16/bf16 fold refusal path on Colab/A100.
 - [ ] `cache_rstd=True` vs `cache_rstd=False` correctness.
 - [ ] `in_place=True` vs `in_place=False` correctness after backward autotune split.
 - [ ] `mode="auto"` behavior when models are in `eval()` but params still have
@@ -132,8 +135,9 @@ Implemented files:
   - blocked rows for fp64 gradcheck and forced reduce-strategy comparison
 - [x] `benchmark/correctness/folding_models.py`
   - tiny Llama-like model for fold equivalence
-  - Gemma-offset fold equivalence
-  - fold refusal checks for trainable params, non-Linear target, and double fold
+  - Gemma-offset fp32 fold equivalence
+  - fold refusal checks for trainable params, non-Linear target, double fold,
+    and Gemma fp16/bf16 default policy
 - [x] `benchmark/correctness/summary.py`
   - formatted environment, summary, forward, backward, option, fold, blocked,
     and failure tables
@@ -159,7 +163,7 @@ Phase 1 checks:
 - [x] `cache_rstd=True` vs `cache_rstd=False`.
 - [x] `in_place=True` vs `in_place=False`.
 - [x] `mode="train"`, `"infer"`, and `"auto"`.
-- [x] Gamma fold equivalence.
+- [x] Gamma fold equivalence for exact/default-supported paths.
 - [x] Gamma fold refusal cases.
 - [x] Blocked Forge fp64 gradcheck shown explicitly.
 - [x] Blocked forced reduce-strategy comparison shown explicitly.
@@ -270,6 +274,8 @@ Choose from this list only after real benchmark results land.
 - [ ] Improve reduce-strategy heuristic if measurements disagree with L2-fit.
 - [ ] Broaden gamma-fold recipes beyond current Llama-like patterns.
 - [ ] Add explicit quantized-linear refusal coverage for gamma folding.
+- [ ] Add optional approximate Gemma fp16/bf16 fold validation against real
+  model outputs if that path is worth keeping.
 
 ## v2 And Later Candidate Work
 

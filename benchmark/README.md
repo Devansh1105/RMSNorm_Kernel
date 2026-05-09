@@ -29,6 +29,8 @@ The output is split into tables:
 - `Backward Correctness`: `dx` and `dweight` vs PyTorch autograd.
 - `Path And Option Checks`: `cache_rstd`, `in_place`, `mode`, row path, and block path coverage.
 - `Gamma Fold Checks`: pre-fold vs post-fold model outputs and refusal cases.
+  Gemma fp16/bf16 folding is expected to refuse by default because it is an
+  approximate rounding-order change.
 - `Blocked Checks`: Forge-required checks that cannot honestly pass yet.
 
 The script prints PASS/FAIL/BLOCKED rows and exits normally after printing the
@@ -56,8 +58,9 @@ Expected v1 result:
 - `mode="train"`, `mode="infer"`, and `mode="auto"`.
 - `cache_rstd=True` vs `cache_rstd=False`.
 - `in_place=True` vs `in_place=False`.
-- Gamma folding equivalence for Llama-like and Gemma-offset models.
-- Gamma folding refusal for trainable params, non-Linear targets, and double fold.
+- Gamma folding equivalence for Llama-like and Gemma-offset fp32 models.
+- Gamma folding refusal for trainable params, non-Linear targets, double fold,
+  and Gemma fp16/bf16 default policy.
 
 ## Troubleshooting
 

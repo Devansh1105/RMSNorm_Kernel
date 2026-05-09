@@ -13,6 +13,8 @@ The fold is done **in-place** on the model. Refuses to fold when:
   - any parameter still requires grad (training)
   - the next op is not a plain ``nn.Linear``
   - the Linear is quantized (int8/int4) — out of scope for v1
+  - Gemma-style RMSNorm is followed by fp16/bf16 Linear weights, unless the
+    caller explicitly opts into approximate low-precision folding
   - the RMSNorm has already been folded (idempotent guard)
 
 References:
@@ -89,7 +91,15 @@ _RECIPES = {
 # ---------------------------------------------------------------------------
 
 
-def _fold_pair(pair: FoldPair) -> None:
+def _is_low_precision_float(dtype: torch.dtype) -> bool:
+    return dtype in (torch.float16, torch.bfloat16)
+
+
+def _is_gemma_casting(norm: FastRMSNorm) -> bool:
+    return norm.casting_mode == "gemma"
+
+
+def _fold_pair(pair: FoldPair, *, allow_approximate_low_precision: bool = False) -> None:
     """In-place fold of one (norm, [linears]) target."""
     norm = pair.norm
     if norm._gamma_folded:
@@ -116,6 +126,19 @@ def _fold_pair(pair: FoldPair) -> None:
             )
         if lin.weight.requires_grad:
             raise RuntimeError(f"{pair.name}: target Linear requires_grad=True; fold is inference-only.")
+
+        if (
+            _is_gemma_casting(norm)
+            and _is_low_precision_float(lin.weight.dtype)
+            and not allow_approximate_low_precision
+        ):
+            raise RuntimeError(
+                f"{pair.name}: Gemma-style fp16/bf16 gamma folding is approximate because Gemma "
+                "multiplies by (1 + weight) in fp32 before casting, while folding stores the "
+                f"scaled Linear weight in {lin.weight.dtype}. Pass "
+                "allow_approximate_low_precision=True only after model-level validation."
+            )
+
         # nn.Linear weight is (out_features, in_features); scale along in_features (dim=1).
         # Do the multiply in fp32 and cast once on store, so we don't double-quantize
         # (`scale.to(bf16) * W.bf16` would round twice).
@@ -135,6 +158,7 @@ def fold_rmsnorm_gamma_into_next_linear(
     *,
     pairs: Iterable[FoldPair] | None = None,
     strict: bool = True,
+    allow_approximate_low_precision: bool = False,
 ) -> int:
     """Fold every RMSNorm γ in ``model`` into the immediately-following Linear's weight.
 
@@ -144,6 +168,10 @@ def fold_rmsnorm_gamma_into_next_linear(
         pairs: explicit list of FoldPair — overrides the recipe; useful for custom archs.
         strict: when True (default), every step must succeed or we raise. When False,
                 a per-pair failure is logged and the rest continue.
+        allow_approximate_low_precision: when False (default), Gemma-style folds
+                into fp16/bf16 Linear weights are refused because they change the
+                rounding order. Set True only for explicitly approximate inference
+                experiments after model-level validation.
 
     Returns:
         Number of (norm, linears) pairs that were successfully folded.
@@ -158,7 +186,7 @@ def fold_rmsnorm_gamma_into_next_linear(
     folded = 0
     for pair in pairs:
         try:
-            _fold_pair(pair)
+            _fold_pair(pair, allow_approximate_low_precision=allow_approximate_low_precision)
             folded += 1
         except Exception:
             if strict:

@@ -1,4 +1,7 @@
 """Small models for gamma-fold correctness checks."""
+"Gemma-style RMSNorm folding into fp16/bf16 nn.Linear weights refused due to precision issues"
+
+
 from __future__ import annotations
 
 import copy
@@ -178,6 +181,39 @@ def run_gemma_fold_check(torch, dtype, *, full: bool = False) -> dict:
     from fast_rmsnorm.transformers import fold_rmsnorm_gamma_into_next_linear
 
     hidden_size = 256 if full else 128
+    if dtype in (torch.float16, torch.bfloat16):
+        row = _fold_row(
+            torch,
+            check="fold_refusal_gemma_low_precision",
+            dtype=dtype,
+            reference="Gemma fp16/bf16 fold should require opt-in",
+            compared="default fold policy",
+            fold=False,
+        )
+        try:
+            torch.manual_seed(5678)
+            model = _build_llama_like(
+                torch,
+                dtype,
+                hidden_size=hidden_size,
+                layers=1,
+                offset=1.0,
+                casting_mode="gemma",
+            )
+            fold_rmsnorm_gamma_into_next_linear(model, arch="llama")
+            row["notes"] = "fold unexpectedly succeeded"
+        except RuntimeError as exc:
+            row.update(
+                {
+                    "shape": f"2x8x{hidden_size}",
+                    "verdict": "PASS",
+                    "notes": str(exc),
+                }
+            )
+        except Exception as exc:
+            row["notes"] = f"{type(exc).__name__}: {exc}"
+        return row
+
     row = _fold_row(
         torch,
         check="fold_equivalence_gemma_offset",

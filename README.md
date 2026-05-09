@@ -96,6 +96,8 @@ not run timings. Isolation and model-level benchmarks are later phases; see
 - fp32 epsilon pinning in the Triton kernels.
 - `cache_rstd` flag for activation-checkpointing workflows.
 - Inference-only gamma folding into following `nn.Linear` weights.
+- Gemma fp16/bf16 gamma folding is refused by default because it changes
+  rounding order; opt in only with explicit approximate-fold validation.
 
 ## Known Limitations
 
@@ -103,6 +105,7 @@ not run timings. Isolation and model-level benchmarks are later phases; see
 - Forge fp64 `gradcheck` is reported as blocked because the current kernel dtype map supports fp32/fp16/bf16 only.
 - Isolation timing and model-level Forge Part B benchmarking are planned as later phases.
 - Gamma folding supports plain `nn.Linear` targets only; quantized linears are out of scope for v1.
+- Gemma low-precision gamma folding is approximate and disabled by default.
 - Persistent autotune-choice caching is not implemented yet.
 
 ## References
