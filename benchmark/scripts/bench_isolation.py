@@ -33,6 +33,7 @@ from benchmark.timing.configs import (
     peak_for_gpu,
     quick_configs,
 )
+from benchmark.timing.contracts import adapter_contracts
 from benchmark.timing.events import benchmark_kernel, prepare_l2_flush, summarize_samples
 from benchmark.timing.profiling import annotate_row
 from benchmark.timing.reporting import markdown_report, print_report
@@ -77,6 +78,8 @@ def _request_for_horizon(horizon: Horizon) -> OperationRequest:
         casting_mode=horizon.casting_mode,
         in_place=horizon.in_place,
         mode="train" if horizon.is_backward else "infer",
+        cache_rstd=horizon.cache_rstd,
+        reduce_strategy=horizon.reduce_strategy,
     )
 
 
@@ -110,6 +113,16 @@ def _observed_grads(x, weight) -> tuple[str, ...]:
     if weight is not None and getattr(weight, "grad", None) is not None:
         observed.append("gamma")
     return tuple(observed)
+
+
+def _kernel_work(adapter: RMSNormAdapter, horizon: Horizon) -> tuple[str, ...]:
+    if not horizon.is_backward:
+        return ()
+    if adapter.name == "Unsloth":
+        return ("x",)
+    if adapter.name in horizon.include_extra_work:
+        return ("x", "gamma")
+    return tuple(horizon.expected_grads)
 
 
 def _canary_status(torch, adapter: RMSNormAdapter, horizon: Horizon, dtype) -> dict:
@@ -216,8 +229,10 @@ def _base_row(
         "eps": horizon_eps(horizon),
         "weight_mode": horizon.weight_mode,
         "in_place": horizon.in_place,
+        "cache_rstd": horizon.cache_rstd,
         "expected_grads": list(horizon.expected_grads),
         "observed_grads": list(observed_grads),
+        "kernel_work": list(_kernel_work(adapter, horizon)),
         "included_in_speedup": included,
         "exclusion_reason": exclusion_reason,
         "stats_ms": {},
@@ -232,6 +247,12 @@ def _base_row(
         "roofline": "unknown",
         "speedup_vs_pytorch": None,
         "speedup_vs_liger": None,
+        "speedup_vs_forge_cached": None,
+        "speedup_vs_forge_auto": None,
+        "speedup_vs_forge_scratch": None,
+        "speedup_vs_liger_scratch_policy": None,
+        "reducer_comparison_group": None,
+        "reducer_policy": None,
         "path": adapter.path(int(config.m), int(config.n), request),
         "status": status,
         "notes": notes,
@@ -387,6 +408,7 @@ def _run_adapter_horizon(torch, adapter, horizon, availability, dtype, dtype_tex
                 "status": status,
                 "observed_grads": list(canary.get("observed_grads") or ()),
                 "expected_grads": list(horizon.expected_grads),
+                "kernel_work": list(_kernel_work(adapter, horizon)),
             }
         )
 
@@ -458,6 +480,82 @@ def _add_speedups(rows: list[dict]) -> None:
                 row["speedup_vs_pytorch"] = baselines["PyTorch"] / median
             if baselines.get("Liger"):
                 row["speedup_vs_liger"] = baselines["Liger"] / median
+
+
+def _add_cache_comparison(rows: list[dict]) -> None:
+    cached = {}
+    for row in rows:
+        if (
+            row.get("horizon_id") == "full_training_backward_safe"
+            and row.get("framework") == "Forge"
+            and row.get("status") == "OK"
+        ):
+            median = (row.get("stats_ms") or {}).get("median")
+            if median and median > 0:
+                cached[(row.get("shape_text"), row.get("casting_mode"))] = median
+
+    for row in rows:
+        if row.get("horizon_id") != "cache_ablation_recompute_rstd_safe_backward":
+            continue
+        median = (row.get("stats_ms") or {}).get("median")
+        baseline = cached.get((row.get("shape_text"), row.get("casting_mode")))
+        if median and median > 0 and baseline:
+            row["speedup_vs_forge_cached"] = baseline / median
+
+
+def _add_reducer_policy_comparison(rows: list[dict]) -> None:
+    specs = [
+        (
+            "Safe Backward",
+            {
+                "Forge auto heuristic": ("full_training_backward_safe", "Forge"),
+                "Forge forced atomic": ("reducer_ablation_atomic_safe_backward", "Forge"),
+                "Forge forced scratch (Liger-style)": ("reducer_ablation_scratch_safe_backward", "Forge"),
+                "Liger scratch baseline": ("full_training_backward_safe", "Liger"),
+            },
+        ),
+        (
+            "In-Place Backward",
+            {
+                "Forge auto heuristic": ("full_training_backward_inplace", "Forge"),
+                "Forge forced atomic": ("reducer_ablation_atomic_inplace_backward", "Forge"),
+                "Forge forced scratch (Liger-style)": ("reducer_ablation_scratch_inplace_backward", "Forge"),
+                "Liger scratch baseline": ("full_training_backward_inplace", "Liger"),
+            },
+        ),
+    ]
+    lookup = {}
+    for row in rows:
+        median = (row.get("stats_ms") or {}).get("median")
+        if row.get("status") == "OK" and median and median > 0:
+            key = (row.get("horizon_id"), row.get("framework"), row.get("shape_text"), row.get("casting_mode"))
+            lookup[key] = row
+
+    for group_name, policies in specs:
+        shapes = sorted({key[2] for key in lookup if key[0] in {spec[0] for spec in policies.values()}})
+        for shape_text in shapes:
+            for casting_mode in sorted({key[3] for key in lookup if key[2] == shape_text}):
+                selected = {}
+                for policy_name, (horizon_id, framework) in policies.items():
+                    row = lookup.get((horizon_id, framework, shape_text, casting_mode))
+                    if row is not None:
+                        selected[policy_name] = row
+                auto = selected.get("Forge auto heuristic")
+                scratch = selected.get("Forge forced scratch (Liger-style)")
+                liger = selected.get("Liger scratch baseline")
+                auto_median = (auto.get("stats_ms") or {}).get("median") if auto else None
+                scratch_median = (scratch.get("stats_ms") or {}).get("median") if scratch else None
+                liger_median = (liger.get("stats_ms") or {}).get("median") if liger else None
+                for policy_name, row in selected.items():
+                    median = (row.get("stats_ms") or {}).get("median")
+                    row["reducer_comparison_group"] = group_name
+                    row["reducer_policy"] = policy_name
+                    if median and median > 0 and auto_median:
+                        row["speedup_vs_forge_auto"] = auto_median / median
+                    if median and median > 0 and scratch_median:
+                        row["speedup_vs_forge_scratch"] = scratch_median / median
+                    if median and median > 0 and liger_median:
+                        row["speedup_vs_liger_scratch_policy"] = liger_median / median
 
 
 def _folding_canary(torch, dtype) -> dict:
@@ -584,6 +682,8 @@ def run(args: argparse.Namespace) -> int:
                     f"{row['shape_text']} {row['gbps']:.1f} > {peak['bandwidth_gbps']:.1f}"
                 )
     _add_speedups(results)
+    _add_cache_comparison(results)
+    _add_reducer_policy_comparison(results)
 
     report = {
         "environment": env,
@@ -606,9 +706,12 @@ def run(args: argparse.Namespace) -> int:
                 "description": horizon.description,
                 "eligible": list(horizon.eligible),
                 "include_extra_work": list(horizon.include_extra_work),
+                "cache_rstd": horizon.cache_rstd,
+                "reduce_strategy": horizon.reduce_strategy,
             }
             for horizon in HORIZONS
         ],
+        "adapter_contracts": adapter_contracts(),
         "capability_matrix": capability_matrix,
         "fairness_exclusions": exclusions,
         "folding_canary": _folding_canary(torch, dtype),

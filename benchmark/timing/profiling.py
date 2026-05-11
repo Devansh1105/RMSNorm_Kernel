@@ -78,7 +78,7 @@ def annotate_row(row: dict, peak: dict) -> None:
         int(shape["n"]),
         row["dtype"],
         weight_mode=row.get("weight_mode", "affine"),
-        expected_grads=tuple(row.get("expected_grads") or ("x", "gamma")),
+        expected_grads=tuple(row.get("kernel_work") or row.get("expected_grads") or ("x", "gamma")),
     )
     stats = row.get("stats_ms") or {}
     latency_ms = stats.get("median") or stats.get("mean")

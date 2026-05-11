@@ -271,29 +271,92 @@ def run_mode_consistency_check(torch, rms_norm, case: dict) -> list[dict]:
 
 
 def run_reduce_strategy_status(torch) -> dict:
-    return {
-        "group": "blocked",
-        "check": "reduce_strategy_direct",
-        "path": "-",
-        "shape": "-",
-        "dtype": "-",
-        "casting": "-",
-        "weight": "-",
-        "mode": "-",
-        "in_place": "-",
-        "cache_rstd": "-",
-        "reference": "forced atomic/scratch comparison",
-        "compared": "public API auto strategy",
-        "tolerance": "-",
-        "max_abs": None,
-        "max_rel": None,
-        "dx_abs": None,
-        "dx_rel": None,
-        "dw_abs": None,
-        "dw_rel": None,
-        "verdict": "BLOCKED",
-        "notes": "No public force flag yet; covered indirectly through selected strategy.",
+    from fast_rmsnorm.transformers import rms_norm
+
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    case = {
+        "path": "block",
+        "shape": (40000, 128),
+        "dtype": dtype,
+        "casting_mode": "llama",
+        "offset": 0.0,
+        "with_weight": True,
+        "mode": "infer",
+        "in_place": False,
+        "cache_rstd": True,
+        "eps": 1e-6,
     }
+    row = _base_row(
+        case,
+        group="internal",
+        check="reduce_strategy_direct",
+        reference="Forge reduce_strategy=auto",
+        compared="Forge reduce_strategy=atomic/scratch",
+    )
+    try:
+        m, n = case["shape"]
+        x = _make_tensor(torch, (m, n), case["dtype"], requires_grad=True)
+        weight = _make_tensor(torch, (n,), case["dtype"], requires_grad=True)
+        grad_out = torch.randn((m, n), device="cuda", dtype=case["dtype"])
+
+        def run_strategy(strategy: str):
+            x_i = x.detach().clone().requires_grad_(True)
+            w_i = weight.detach().clone().requires_grad_(True)
+            out = rms_norm(
+                x_i,
+                w_i,
+                case["eps"],
+                offset=case["offset"],
+                casting_mode=case["casting_mode"],
+                in_place=case["in_place"],
+                mode=case["mode"],
+                cache_rstd=case["cache_rstd"],
+                reduce_strategy=strategy,
+            )
+            grads = torch.autograd.grad(out, [x_i, w_i], grad_out.detach(), retain_graph=False)
+            return out, grads
+
+        out_auto, grads_auto = run_strategy("auto")
+        out_atomic, grads_atomic = run_strategy("atomic")
+        out_scratch, grads_scratch = run_strategy("scratch")
+        threshold = threshold_for(case["dtype"], casting_mode=case["casting_mode"])
+        checks = [
+            max_atol_rtol(torch, out_atomic, out_auto),
+            max_atol_rtol(torch, grads_atomic[0], grads_auto[0]),
+            max_atol_rtol(torch, grads_atomic[1], grads_auto[1]),
+            max_atol_rtol(torch, out_scratch, out_auto),
+            max_atol_rtol(torch, grads_scratch[0], grads_auto[0]),
+            max_atol_rtol(torch, grads_scratch[1], grads_auto[1]),
+        ]
+        passed = (
+            is_close(torch, out_atomic, out_auto, threshold)
+            and is_close(torch, grads_atomic[0], grads_auto[0], threshold)
+            and is_close(torch, grads_atomic[1], grads_auto[1], threshold)
+            and is_close(torch, out_scratch, out_auto, threshold)
+            and is_close(torch, grads_scratch[0], grads_auto[0], threshold)
+            and is_close(torch, grads_scratch[1], grads_auto[1], threshold)
+        )
+        row.update(
+            {
+                "max_abs": max(item[0] for item in checks),
+                "max_rel": max(item[1] for item in checks),
+                "dx_abs": max(checks[1][0], checks[4][0]),
+                "dx_rel": max(checks[1][1], checks[4][1]),
+                "dw_abs": max(checks[2][0], checks[5][0]),
+                "dw_rel": max(checks[2][1], checks[5][1]),
+                "verdict": verdict(passed),
+            }
+        )
+    except Exception as exc:
+        return _failure_row(
+            case,
+            group="internal",
+            check="reduce_strategy_direct",
+            reference="Forge reduce_strategy=auto",
+            compared="Forge reduce_strategy=atomic/scratch",
+            error=exc,
+        )
+    return row
 
 
 def run_gradcheck_status() -> dict:

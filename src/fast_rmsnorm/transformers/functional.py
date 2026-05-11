@@ -17,6 +17,7 @@ def rms_norm(
     row_mode: bool | None = None,
     mode: str = "auto",
     cache_rstd: bool = True,
+    reduce_strategy: str = "auto",
 ) -> torch.Tensor:
     """Compute RMSNorm.
 
@@ -32,7 +33,10 @@ def rms_norm(
               'auto' picks by ``requires_grad``
         cache_rstd: if False, fwd skips rstd store and bwd recomputes (use with
                     activation checkpointing)
+        reduce_strategy: 'auto', 'atomic', or 'scratch' for dweight reduction.
+                    This is intended for benchmarking/debugging; production
+                    callers should normally leave the default.
     """
     return FastRMSNormFunction.apply(
-        x, weight, eps, offset, casting_mode, in_place, row_mode, mode, cache_rstd,
+        x, weight, eps, offset, casting_mode, in_place, row_mode, mode, cache_rstd, reduce_strategy,
     )

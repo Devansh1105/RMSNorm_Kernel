@@ -67,8 +67,11 @@ Fill this table after runs finish.
 - [x] Block-kernel autotune over `BLOCK_ROW`.
 - [x] dweight reduce strategy branch: scratch buffer or atomic add.
 - [x] Runtime L2-fit heuristic for dweight reduce strategy.
+- [x] Public/debug `reduce_strategy="auto"|"atomic"|"scratch"` knob for
+  forced reducer ablation. Default remains `auto`.
 - [x] fp32 epsilon pinning inside Triton kernels.
 - [x] `cache_rstd` flag.
+- [x] `cache_rstd=False` recompute path has an isolation timing horizon.
 - [x] Inference-only gamma folding.
 - [x] Gemma fp16/bf16 gamma folding refuses by default; approximate fold requires
   explicit opt-in.
@@ -91,12 +94,14 @@ Fill this table after runs finish.
 
 - [ ] Forge fp64 gradcheck is blocked because the current Triton dtype map only
   supports fp32/fp16/bf16.
-- [ ] Direct forced atomic-vs-scratch comparison is blocked until the public API
-  exposes a debug force flag.
+- [ ] Forced atomic-vs-scratch correctness and timing need GPU validation on
+  T4/L4 and A100/H100.
 - [ ] Feature dimensions above Triton's fused block limit still need future
   streaming support.
 - [ ] Persistent autotune-choice cache is not implemented yet.
-- [ ] Direct Unsloth RMSNorm adapter may depend on installed Unsloth API version.
+- [ ] Direct Unsloth RMSNorm adapter is source-audited against
+  `fast_rms_layernorm(layernorm, X, gemma=...)`; installed versions still need
+  runtime canary validation.
 
 ## Benchmark Rewrite
 
@@ -201,11 +206,18 @@ Implemented files:
   - PyTorch explicit-formula adapter
   - Forge adapter using `fast_rmsnorm.transformers.rms_norm`
   - Liger adapter using `liger_kernel.ops.LigerRMSNormFunction`
-  - Unsloth direct adapter or explicit `NOT_RUN` reason
+  - Unsloth direct adapter using the audited
+    `unsloth.kernels.rms_layernorm.fast_rms_layernorm(layernorm, X, gemma=...)`
+    API, or explicit `NOT_RUN` reason
+- [x] `benchmark/timing/contracts.py`
+  - source-audited API contract table for PyTorch, Forge, Liger, and Unsloth
+  - records supported semantics and caveats used to decide fair horizons
 - [x] `benchmark/timing/scenarios.py`
   - horizon definitions for apples-to-apples comparison
   - full trainable backward, in-place speed mode, frozen-gamma dx-only,
-    folded/no-gamma, no-gamma backward, and casting semantics
+    folded/no-gamma, no-gamma backward, cache-rstd recompute ablation, and
+    casting semantics
+  - forced Forge atomic/scratch reducer ablation horizons
 - [x] `benchmark/timing/cold_start.py`
   - representative cold-start/autotune timing in a fresh subprocess
   - temporary Triton cache so cold-start is not mixed with steady-state timing
@@ -222,8 +234,11 @@ Implemented files:
   - Competitor Availability
   - Capability Matrix
   - Fairness Exclusions
+  - Source-Audited API Contracts
   - Cold Start / Autotune
   - separate steady-state tables per benchmark horizon
+  - Reducer Policy Comparison summary for Forge auto heuristic vs Forge forced
+    atomic vs Forge forced scratch/Liger-style vs Liger scratch baseline
   - VRAM
   - Profiling
   - Path Coverage
@@ -234,7 +249,11 @@ Implemented files:
   - prints a reminder to run Phase 1 separately
   - deterministic seeded inputs built outside timed regions
   - records horizon-aware forward and derived backward rows
+  - reports `cache_rstd=False` rows relative to cached Forge baseline
+  - reports reducer policy rows relative to Forge auto, Forge scratch, and
+    Liger scratch baselines
   - validates expected gradients before timing each adapter/horizon
+  - reports autograd-visible grads separately from source-inferred kernel work
   - excludes non-comparable rows from speedup calculations
   - records `NOT_RUN`, `NOT_COMPARABLE`, and `EXTRA_WORK_REFERENCE` states
   - continues through per-row errors
@@ -260,6 +279,20 @@ Purpose: implement Forge Part B after isolation timing is stable.
 - [ ] Forge-patched model path.
 - [ ] Liger-patched model path.
 - [ ] Unsloth model-level comparison path.
+- [ ] Framework-specific fair-shot run structure:
+  - import and patch each framework in the order its docs require
+  - isolate globally patching frameworks, especially Unsloth, in separate
+    processes so their monkey patches do not contaminate PyTorch, Forge, or
+    Liger runs
+  - audit each framework's patch helper before using it; record whether it
+    patches only RMSNorm or also attention, MLP, cross entropy, optimizers,
+    tokenization, RoPE, fused losses, or other modules
+  - prefer RMSNorm-only patch paths for RMSNorm attribution; if a framework
+    exposes only bundled/global patching, report that separately and do not use
+    it as an RMSNorm-only comparison without an explicit decision
+  - report the exact import order, patch helper, trainable parameter set, and
+    patched module counts per framework
+  - keep LoRA/frozen-base comparisons separate from full-finetune comparisons
 - [ ] LoRA SFT step-time loop.
 - [ ] Fixed-seed convergence/loss comparison.
 - [ ] Peak VRAM and tokens/sec reporting.
@@ -296,7 +329,8 @@ Fill after Phase 2 full isolation benchmark.
 | Any shape regresses by more than 5 percent? | TBD | TBD |
 | Atomic dweight better for QK-norm shapes? | TBD | TBD |
 | Scratch dweight better for long-context shapes? | TBD | TBD |
-| `cache_rstd=False` worth changing default? | TBD | TBD |
+| Forge auto heuristic better than forced scratch? | TBD | Use Reducer Policy Comparison by shape/GPU |
+| `cache_rstd=False` worth changing default? | TBD | Use cache ablation horizon; compare `vs Cached` by shape/GPU |
 | Any autotune cold-start issue? | TBD | TBD |
 
 ## v1.5 Candidate Work
@@ -304,8 +338,11 @@ Fill after Phase 2 full isolation benchmark.
 Choose from this list only after real benchmark results land.
 
 - [ ] Fix any Phase 1 correctness failures.
-- [ ] Add a public debug flag to force atomic vs scratch dweight reduction.
+- [x] Add a public debug flag to force atomic vs scratch dweight reduction.
 - [ ] Add persistent autotune-choice cache keyed by GPU and kernel key.
+- [ ] Add public API control for autotune policy, e.g. heuristic/default vs
+  force-autotune, so users can explicitly pay cold-start cost when they expect
+  enough repeated calls to amortize it.
 - [ ] Add performance regression guard using achieved bandwidth thresholds.
 - [ ] Revisit `cache_rstd` default from measured memory/time tradeoff.
 - [ ] Add grid-multiplier autotune for backward if bandwidth utilization shows
@@ -325,4 +362,8 @@ Choose from this list only after real benchmark results land.
 - [ ] RMSNorm + `lm_head` specialization or fusion.
 - [ ] Matmul epilogue writes output plus row sum-of-squares.
 - [ ] Full RMSNorm in matmul epilogue.
+- [ ] Add adaptive autotune policy once final benchmarks quantify cold-start
+  cost vs steady-state speedup. Candidate behavior: start with heuristic kernels,
+  track repeated calls per shape/GPU key, and trigger Triton autotune once call
+  count exceeds a threshold `x`; choose `x` from measured amortization data.
 - [ ] AMD/ROCm tuning pass after the NVIDIA path is stable.

@@ -42,6 +42,22 @@ def _availability_rows(availability: dict) -> list[list[object]]:
     ]
 
 
+def _contract_rows(report: dict) -> list[list[object]]:
+    contracts = report.get("adapter_contracts", {})
+    rows = []
+    for name, item in contracts.items():
+        rows.append(
+            [
+                name,
+                item.get("api", ""),
+                item.get("capabilities", ""),
+                item.get("caveats", ""),
+                item.get("source", ""),
+            ]
+        )
+    return rows
+
+
 def _capability_rows(report: dict) -> list[list[object]]:
     return [
         [
@@ -88,6 +104,45 @@ def _cold_start_rows(report: dict) -> list[list[object]]:
     return rows
 
 
+def _reducer_policy_rows(report: dict) -> list[list[object]]:
+    rows = []
+    policy_order = {
+        "Forge auto heuristic": 0,
+        "Forge forced atomic": 1,
+        "Forge forced scratch (Liger-style)": 2,
+        "Liger scratch baseline": 3,
+    }
+    selected = [
+        row
+        for row in report.get("results", [])
+        if row.get("reducer_comparison_group") and row.get("reducer_policy")
+    ]
+    selected.sort(
+        key=lambda row: (
+            row.get("reducer_comparison_group") or "",
+            row.get("shape_text") or _shape_text(row["shape"]),
+            policy_order.get(row.get("reducer_policy"), 99),
+        )
+    )
+    for row in selected:
+        rows.append(
+            [
+                row.get("reducer_comparison_group"),
+                row.get("shape_text") or _shape_text(row["shape"]),
+                row.get("reducer_policy"),
+                row["status"],
+                _latency(row, "median"),
+                _latency(row, "p95"),
+                _speedup(row, "speedup_vs_forge_auto"),
+                _speedup(row, "speedup_vs_forge_scratch"),
+                _speedup(row, "speedup_vs_liger_scratch_policy"),
+                format_float(row.get("gbps")) if row.get("status") in TIMED_STATUSES else "-",
+                row.get("path") or "-",
+            ]
+        )
+    return rows
+
+
 def _horizon_rows(report: dict, horizon_id: str) -> list[list[object]]:
     selected = [row for row in report["results"] if row["horizon_id"] == horizon_id]
     return [
@@ -99,9 +154,11 @@ def _horizon_rows(report: dict, horizon_id: str) -> list[list[object]]:
             _latency(row, "p95"),
             _speedup(row, "speedup_vs_pytorch"),
             _speedup(row, "speedup_vs_liger"),
+            _speedup(row, "speedup_vs_forge_cached"),
             format_float(row.get("gbps")) if row.get("status") in TIMED_STATUSES else "-",
             format_float(row.get("peak_utilization_pct")) if row.get("status") in TIMED_STATUSES else "-",
             ",".join(row.get("observed_grads") or ()) or "-",
+            ",".join(row.get("kernel_work") or ()) or "-",
             row.get("path") or "-",
             row.get("exclusion_reason") or row.get("notes") or "",
         ]
@@ -154,7 +211,13 @@ def _path_rows(report: dict) -> list[list[object]]:
 def _horizon_meta(horizon: dict) -> str:
     eligible = ", ".join(horizon.get("eligible") or ()) or "-"
     extra = ", ".join(horizon.get("include_extra_work") or ()) or "-"
-    return f"Measures: {horizon['description']} | Eligible: {eligible} | Extra-work references: {extra}"
+    reduce_strategy = horizon.get("reduce_strategy") or "auto"
+    cache_rstd = horizon.get("cache_rstd", True)
+    return (
+        f"Measures: {horizon['description']} | Eligible: {eligible} | "
+        f"Extra-work references: {extra} | cache_rstd: {cache_rstd} | "
+        f"Forge reducer: {reduce_strategy}"
+    )
 
 
 def print_report(report: dict) -> None:
@@ -195,6 +258,9 @@ def print_report(report: dict) -> None:
     print_section("Competitor Availability")
     print_table(["Framework", "Status", "Notes"], _availability_rows(report["competitor_availability"]))
 
+    print_section("Source-Audited API Contracts")
+    print_table(["Framework", "API", "Capabilities", "Caveats", "Source"], _contract_rows(report))
+
     print_section("Capability Matrix")
     print_table(["Framework", "Horizon", "Status", "Expected", "Observed", "Reason"], _capability_rows(report))
 
@@ -208,6 +274,24 @@ def print_report(report: dict) -> None:
     print_section("Cold Start / Autotune")
     print_table(["Horizon", "Framework", "Shape", "Status", "Elapsed ms", "Peak", "Notes"], _cold_start_rows(report))
 
+    print_section("Reducer Policy Comparison")
+    print_table(
+        [
+            "Mode",
+            "Shape",
+            "Policy",
+            "Status",
+            "Median ms",
+            "P95 ms",
+            "vs Forge Auto",
+            "vs Forge Scratch",
+            "vs Liger Scratch",
+            "GB/s",
+            "Path",
+        ],
+        _reducer_policy_rows(report),
+    )
+
     print_section("Steady-State Timing")
     headers = [
         "Shape",
@@ -217,9 +301,11 @@ def print_report(report: dict) -> None:
         "P95 ms",
         "vs PyTorch",
         "vs Liger",
+        "vs Cached",
         "GB/s",
         "Peak %",
-        "Observed",
+        "Autograd grads",
+        "Kernel work",
         "Path",
         "Notes",
     ]
@@ -293,6 +379,8 @@ def markdown_report(report: dict) -> str:
             ),
             "## Competitor Availability",
             _md_table(["Framework", "Status", "Notes"], _availability_rows(report["competitor_availability"])),
+            "## Source-Audited API Contracts",
+            _md_table(["Framework", "API", "Capabilities", "Caveats", "Source"], _contract_rows(report)),
             "## Capability Matrix",
             _md_table(["Framework", "Horizon", "Status", "Expected", "Observed", "Reason"], _capability_rows(report)),
             "## Fairness Exclusions",
@@ -304,6 +392,23 @@ def markdown_report(report: dict) -> str:
             ),
             "## Cold Start / Autotune",
             _md_table(["Horizon", "Framework", "Shape", "Status", "Elapsed ms", "Peak", "Notes"], _cold_start_rows(report)),
+            "## Reducer Policy Comparison",
+            _md_table(
+                [
+                    "Mode",
+                    "Shape",
+                    "Policy",
+                    "Status",
+                    "Median ms",
+                    "P95 ms",
+                    "vs Forge Auto",
+                    "vs Forge Scratch",
+                    "vs Liger Scratch",
+                    "GB/s",
+                    "Path",
+                ],
+                _reducer_policy_rows(report),
+            ),
             "## Steady-State Timing",
         ]
     )
@@ -315,9 +420,11 @@ def markdown_report(report: dict) -> str:
         "P95 ms",
         "vs PyTorch",
         "vs Liger",
+        "vs Cached",
         "GB/s",
         "Peak %",
-        "Observed",
+        "Autograd grads",
+        "Kernel work",
         "Path",
         "Notes",
     ]
@@ -339,4 +446,3 @@ def markdown_report(report: dict) -> str:
         ]
     )
     return "\n".join(parts)
-

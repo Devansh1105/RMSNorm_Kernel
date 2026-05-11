@@ -20,6 +20,7 @@ class FastRMSNorm(nn.Module):
         mode:         'train' | 'infer' | 'auto'
         cache_rstd:   pass False alongside activation checkpointing
         in_place:     reuse dY storage for dX during backward
+        reduce_strategy: benchmark/debug control for dweight reduction
 
     The ``_gamma_folded`` flag is flipped True by
     ``fast_rmsnorm.transformers.folding.fold_rmsnorm_gamma_into_next_linear``
@@ -38,6 +39,7 @@ class FastRMSNorm(nn.Module):
         elementwise_affine: bool = True,
         mode: str = "auto",
         cache_rstd: bool = True,
+        reduce_strategy: str = "auto",
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -48,6 +50,7 @@ class FastRMSNorm(nn.Module):
         self.elementwise_affine = elementwise_affine
         self.mode = mode
         self.cache_rstd = cache_rstd
+        self.reduce_strategy = reduce_strategy
         self._gamma_folded = False
 
         if elementwise_affine:
@@ -61,17 +64,18 @@ class FastRMSNorm(nn.Module):
             return rms_norm(
                 x, None, self.eps,
                 offset=0.0, casting_mode=self.casting_mode, in_place=self.in_place,
-                mode=self.mode, cache_rstd=self.cache_rstd,
+                mode=self.mode, cache_rstd=self.cache_rstd, reduce_strategy=self.reduce_strategy,
             )
         return rms_norm(
             x, self.weight, self.eps,
             offset=self.offset, casting_mode=self.casting_mode, in_place=self.in_place,
-            mode=self.mode, cache_rstd=self.cache_rstd,
+            mode=self.mode, cache_rstd=self.cache_rstd, reduce_strategy=self.reduce_strategy,
         )
 
     def extra_repr(self) -> str:
         return (
             f"hidden_size={self.hidden_size}, eps={self.eps}, offset={self.offset}, "
             f"casting_mode={self.casting_mode!r}, mode={self.mode!r}, "
-            f"cache_rstd={self.cache_rstd}, gamma_folded={self._gamma_folded}"
+            f"cache_rstd={self.cache_rstd}, reduce_strategy={self.reduce_strategy!r}, "
+            f"gamma_folded={self._gamma_folded}"
         )

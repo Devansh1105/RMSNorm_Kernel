@@ -46,3 +46,10 @@ benchmark/*.png
 *.log
 *.tmp
 *.swp
+
+# Vendored reference checkouts (not pushed)
+refs/unsloth/
+refs/unsloth
+
+# Personal scratch notes
+Test.md

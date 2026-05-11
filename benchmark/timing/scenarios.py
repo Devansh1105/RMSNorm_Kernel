@@ -19,6 +19,8 @@ class Horizon:
     casting_mode: str
     offset: float
     full_sweep: bool
+    cache_rstd: bool = True
+    reduce_strategy: str = "auto"
     include_extra_work: tuple[str, ...] = ()
 
     @property
@@ -67,6 +69,20 @@ HORIZONS = [
         full_sweep=True,
     ),
     Horizon(
+        id="cache_ablation_recompute_rstd_safe_backward",
+        name="Cache Ablation: Recompute RSTD Backward",
+        description="Full trainable Forge backward with cache_rstd=False, in_place=False. Compares against cached RSTD.",
+        eligible=("Forge",),
+        operation="backward_full",
+        weight_mode="trainable_gamma",
+        expected_grads=("x", "gamma"),
+        in_place=False,
+        casting_mode="llama",
+        offset=0.0,
+        full_sweep=True,
+        cache_rstd=False,
+    ),
+    Horizon(
         id="frozen_gamma_backward_dx_only",
         name="Frozen-Gamma Backward (dX Only)",
         description="LoRA-style backward where gamma is frozen and only dX is required.",
@@ -79,6 +95,62 @@ HORIZONS = [
         offset=0.0,
         full_sweep=True,
         include_extra_work=("Forge", "Liger"),
+    ),
+    Horizon(
+        id="reducer_ablation_atomic_safe_backward",
+        name="Reducer Ablation: Atomic Safe Backward",
+        description="Full trainable RMSNorm backward with Forge dGamma reducer forced to atomic, in_place=False.",
+        eligible=("Forge", "Liger"),
+        operation="backward_full",
+        weight_mode="trainable_gamma",
+        expected_grads=("x", "gamma"),
+        in_place=False,
+        casting_mode="llama",
+        offset=0.0,
+        full_sweep=True,
+        reduce_strategy="atomic",
+    ),
+    Horizon(
+        id="reducer_ablation_scratch_safe_backward",
+        name="Reducer Ablation: Scratch Safe Backward",
+        description="Full trainable RMSNorm backward with Forge dGamma reducer forced to scratch, in_place=False.",
+        eligible=("Forge", "Liger"),
+        operation="backward_full",
+        weight_mode="trainable_gamma",
+        expected_grads=("x", "gamma"),
+        in_place=False,
+        casting_mode="llama",
+        offset=0.0,
+        full_sweep=True,
+        reduce_strategy="scratch",
+    ),
+    Horizon(
+        id="reducer_ablation_atomic_inplace_backward",
+        name="Reducer Ablation: Atomic In-Place Backward",
+        description="Full trainable RMSNorm backward with Forge dGamma reducer forced to atomic, in_place=True.",
+        eligible=("Forge", "Liger"),
+        operation="backward_full",
+        weight_mode="trainable_gamma",
+        expected_grads=("x", "gamma"),
+        in_place=True,
+        casting_mode="llama",
+        offset=0.0,
+        full_sweep=True,
+        reduce_strategy="atomic",
+    ),
+    Horizon(
+        id="reducer_ablation_scratch_inplace_backward",
+        name="Reducer Ablation: Scratch In-Place Backward",
+        description="Full trainable RMSNorm backward with Forge dGamma reducer forced to scratch, in_place=True.",
+        eligible=("Forge", "Liger"),
+        operation="backward_full",
+        weight_mode="trainable_gamma",
+        expected_grads=("x", "gamma"),
+        in_place=True,
+        casting_mode="llama",
+        offset=0.0,
+        full_sweep=True,
+        reduce_strategy="scratch",
     ),
     Horizon(
         id="folded_gamma_forward_no_gamma",
@@ -165,4 +237,3 @@ def canary_config() -> TimingConfig:
 
 def horizon_eps(_: Horizon) -> float:
     return DEFAULT_EPS
-

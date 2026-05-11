@@ -72,6 +72,11 @@ def resolve_casting_mode(casting_mode):
 REDUCE_STRATEGY_SCRATCH: tl.constexpr = tl.constexpr(0)  # Liger-style 2-stage scratch buffer
 REDUCE_STRATEGY_ATOMIC: tl.constexpr = tl.constexpr(1)   # tl.atomic_add into a single dW buffer
 
+_str_to_reduce_strategy = {
+    "scratch": REDUCE_STRATEGY_SCRATCH.value,
+    "atomic": REDUCE_STRATEGY_ATOMIC.value,
+}
+
 
 def dtype_id(dtype: torch.dtype) -> int:
     """Stable int per dtype — used in autotune key so configs differ by dtype."""
@@ -94,3 +99,14 @@ def pick_reduce_strategy(sm_count: int, n_cols: int, device: torch.device) -> in
         return REDUCE_STRATEGY_SCRATCH.value  # safe default if we can't introspect
     working_set = sm_count * n_cols * 4
     return REDUCE_STRATEGY_ATOMIC.value if working_set < 0.5 * l2 else REDUCE_STRATEGY_SCRATCH.value
+
+
+def resolve_reduce_strategy(reduce_strategy, sm_count: int, n_cols: int, device: torch.device) -> int:
+    """Resolve 'auto'|'atomic'|'scratch' or a raw strategy id."""
+    if isinstance(reduce_strategy, int):
+        assert reduce_strategy in _str_to_reduce_strategy.values(), f"Invalid reduce strategy: {reduce_strategy}"
+        return reduce_strategy
+    if reduce_strategy == "auto":
+        return pick_reduce_strategy(sm_count, n_cols, device)
+    assert reduce_strategy in _str_to_reduce_strategy, f"Invalid reduce strategy: {reduce_strategy}"
+    return _str_to_reduce_strategy[reduce_strategy]

@@ -18,6 +18,8 @@ class OperationRequest:
     casting_mode: str
     in_place: bool
     mode: str
+    cache_rstd: bool = True
+    reduce_strategy: str = "auto"
 
 
 class RMSNormAdapter:
@@ -41,6 +43,9 @@ class RMSNormAdapter:
 
     def path(self, m: int, n: int, request: OperationRequest) -> str:
         return "framework"
+
+    def contract_name(self) -> str:
+        return self.name
 
 
 class PyTorchAdapter(RMSNormAdapter):
@@ -89,7 +94,8 @@ class ForgeAdapter(RMSNormAdapter):
             casting_mode=request.casting_mode,
             in_place=request.in_place,
             mode=request.mode,
-            cache_rstd=True,
+            cache_rstd=request.cache_rstd,
+            reduce_strategy=request.reduce_strategy,
         )
 
     def path(self, m: int, n: int, request: OperationRequest) -> str:
@@ -104,15 +110,21 @@ class ForgeAdapter(RMSNormAdapter):
                     pick_reduce_strategy,
                 )
 
-                sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-                reduce_strategy = (
-                    "atomic"
-                    if pick_reduce_strategy(sm_count, n, torch.device("cuda")) == REDUCE_STRATEGY_ATOMIC.value
-                    else "scratch"
-                )
+                if request.reduce_strategy != "auto":
+                    reduce_strategy = request.reduce_strategy
+                else:
+                    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+                    reduce_strategy = (
+                        "atomic"
+                        if pick_reduce_strategy(sm_count, n, torch.device("cuda")) == REDUCE_STRATEGY_ATOMIC.value
+                        else "scratch"
+                    )
             except Exception:
                 reduce_strategy = "unknown"
-        return f"forge-{kernel_path} mode={request.mode} in_place={request.in_place} reduce={reduce_strategy}"
+        return (
+            f"forge-{kernel_path} mode={request.mode} in_place={request.in_place} "
+            f"cache_rstd={request.cache_rstd} reduce={reduce_strategy}"
+        )
 
 
 class LigerAdapter(RMSNormAdapter):
@@ -148,7 +160,7 @@ class LigerAdapter(RMSNormAdapter):
 
     def path(self, m: int, n: int, request: OperationRequest) -> str:
         kernel_path = "block" if m >= 32768 and n <= 256 else "row"
-        return f"liger-{kernel_path} in_place={request.in_place}"
+        return f"liger-{kernel_path} in_place={request.in_place} reduce=scratch"
 
 
 @dataclass
@@ -173,9 +185,10 @@ class UnslothAdapter(RMSNormAdapter):
         except Exception as exc:  # noqa: BLE001 - availability should report import cause.
             return False, f"{type(exc).__name__}: {exc}"
 
-        candidates = ("fast_rms_layernorm", "rms_layernorm", "Fast_RMS_Layernorm")
-        if not any(hasattr(self._module, candidate) for candidate in candidates):
-            return False, "unsloth.kernels.rms_layernorm has no known direct RMSNorm API"
+        if not hasattr(self._module, "fast_rms_layernorm"):
+            return False, "unsloth.kernels.rms_layernorm.fast_rms_layernorm is missing"
+        if not hasattr(self._module, "Fast_RMS_Layernorm"):
+            return False, "unsloth.kernels.rms_layernorm.Fast_RMS_Layernorm is missing"
         return True, "unsloth.kernels.rms_layernorm direct API"
 
     def _api_module(self):
@@ -186,38 +199,22 @@ class UnslothAdapter(RMSNormAdapter):
         return self._module
 
     def forward(self, x, weight, request: OperationRequest):
-        if request.offset != 0.0:
-            raise NotRunnableError("Unsloth direct adapter only supports offset=0.0 in this benchmark")
+        if weight is None:
+            raise NotRunnableError("Unsloth source API requires layernorm.weight; no-gamma path is unsupported")
+        if request.casting_mode not in {"llama", "gemma"}:
+            raise NotRunnableError("Unsloth source API supports llama/gemma RMSNorm semantics only")
+        if request.casting_mode == "llama" and request.offset != 0.0:
+            raise NotRunnableError("Unsloth llama RMSNorm source API has no arbitrary offset parameter")
+        if request.casting_mode == "gemma" and request.offset != 1.0:
+            raise NotRunnableError("Unsloth gemma RMSNorm source API hardcodes weight + 1.0 semantics")
         module = self._api_module()
         layernorm = _LayerNormShim(weight=weight, variance_epsilon=request.eps)
         gemma = request.casting_mode == "gemma"
-        errors = []
-
-        for name in ("fast_rms_layernorm", "rms_layernorm"):
-            fn = getattr(module, name, None)
-            if fn is None:
-                continue
-            for args, kwargs in (
-                ((layernorm, x), {"gemma": gemma}),
-                ((layernorm, x), {}),
-                ((x, weight, request.eps), {}),
-            ):
-                try:
-                    return fn(*args, **kwargs)
-                except Exception as exc:  # noqa: BLE001 - try next known signature.
-                    errors.append(f"{name}: {type(exc).__name__}: {exc}")
-
-        function = getattr(module, "Fast_RMS_Layernorm", None)
-        if function is not None and hasattr(function, "apply"):
-            for args in ((x, weight, request.eps), (x, weight, request.eps, gemma)):
-                try:
-                    return function.apply(*args)
-                except Exception as exc:  # noqa: BLE001 - try next known signature.
-                    errors.append(f"Fast_RMS_Layernorm.apply: {type(exc).__name__}: {exc}")
-
-        detail = "; ".join(errors[-3:]) if errors else "no known callable found"
-        raise NotRunnableError(f"Unsloth direct RMSNorm API incompatible: {detail}")
+        try:
+            return module.fast_rms_layernorm(layernorm, x, gemma=gemma)
+        except TypeError as exc:
+            raise NotRunnableError(f"Unsloth installed API does not match audited source API: {exc}") from exc
 
     def path(self, m: int, n: int, request: OperationRequest) -> str:
-        return "unsloth-direct"
-
+        gemma = request.casting_mode == "gemma"
+        return f"unsloth-fast_rms_layernorm gemma={gemma} dgamma=False"

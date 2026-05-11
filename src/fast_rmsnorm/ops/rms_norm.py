@@ -52,8 +52,8 @@ from fast_rmsnorm.ops.utils import (
     calculate_settings,
     dtype_id,
     ensure_contiguous,
-    pick_reduce_strategy,
     resolve_casting_mode,
+    resolve_reduce_strategy,
     torch_to_triton_dtype,
 )
 
@@ -523,13 +523,13 @@ _block_rms_norm_forward_kernel_at = triton.autotune(
 
 _rms_norm_backward_kernel_at = triton.autotune(
     configs=_BACKWARD_AUTOTUNE_CONFIGS,
-    key=["BLOCK_SIZE", "DTYPE_ID"],
+    key=["BLOCK_SIZE", "DTYPE_ID", "REDUCE_STRATEGY"],
     reset_to_zero=["dW_ptr"],
 )(_rms_norm_backward_kernel)
 
 _rms_norm_backward_kernel_at_inplace = triton.autotune(
     configs=_BACKWARD_AUTOTUNE_CONFIGS,
-    key=["BLOCK_SIZE", "DTYPE_ID"],
+    key=["BLOCK_SIZE", "DTYPE_ID", "REDUCE_STRATEGY"],
     reset_to_zero=["dW_ptr"],
     restore_value=["dY_ptr"],
 )(_rms_norm_backward_kernel)
@@ -537,13 +537,13 @@ _rms_norm_backward_kernel_at_inplace = triton.autotune(
 # Block backward gets BLOCK_ROW autotuned too — this is where QK-norm wins live.
 _block_rms_norm_backward_kernel_at = triton.autotune(
     configs=_BLOCK_BACKWARD_AUTOTUNE_CONFIGS,
-    key=["BLOCK_SIZE", "DTYPE_ID"],
+    key=["BLOCK_SIZE", "DTYPE_ID", "REDUCE_STRATEGY"],
     reset_to_zero=["dW_ptr"],
 )(_block_rms_norm_backward_kernel)
 
 _block_rms_norm_backward_kernel_at_inplace = triton.autotune(
     configs=_BLOCK_BACKWARD_AUTOTUNE_CONFIGS,
-    key=["BLOCK_SIZE", "DTYPE_ID"],
+    key=["BLOCK_SIZE", "DTYPE_ID", "REDUCE_STRATEGY"],
     reset_to_zero=["dW_ptr"],
     restore_value=["dY_ptr"],
 )(_block_rms_norm_backward_kernel)
@@ -669,7 +669,7 @@ def rms_norm_forward(X, W, eps, offset, casting_mode, *, mode="auto", row_mode=N
 
 def rms_norm_backward(
     dY, X, W, RSTD, eps, offset, casting_mode, BLOCK_SIZE, num_warps, in_place,
-    *, mode="train", row_mode=None, cache_rstd=True,
+    *, mode="train", row_mode=None, cache_rstd=True, reduce_strategy="auto",
 ):
     eps = float(eps)
     shape = dY.shape
@@ -690,7 +690,7 @@ def rms_norm_backward(
     # SCRATCH for large (would spill). The strategy is a constexpr in the
     # kernel — both paths compile, so this is a runtime data choice only.
     if elementwise_affine:
-        reduce_strategy = pick_reduce_strategy(sm_count, n_cols, X.device)
+        reduce_strategy = resolve_reduce_strategy(reduce_strategy, sm_count, n_cols, X.device)
         if reduce_strategy == REDUCE_STRATEGY_ATOMIC.value:
             _dW = torch.zeros(n_cols, dtype=torch.float32, device=W.device)
             dW_row_stride = 0
@@ -805,13 +805,14 @@ class FastRMSNormFunction(torch.autograd.Function):
         row_mode: force row-per-program path; None lets dispatcher choose
         mode: 'train' | 'infer' | 'auto' (auto picks by requires_grad)
         cache_rstd: if False, fwd skips rstd store and bwd recomputes from X
+        reduce_strategy: 'auto' | 'atomic' | 'scratch' for dweight reduction
     """
 
     @staticmethod
     @ensure_contiguous
     def forward(
         ctx, X, W, eps, offset=0.0, casting_mode="llama", in_place=True,
-        row_mode=None, mode="auto", cache_rstd=True,
+        row_mode=None, mode="auto", cache_rstd=True, reduce_strategy="auto",
     ):
         if _is_dtensor(X):
             X = X.full_tensor()
@@ -829,6 +830,7 @@ class FastRMSNormFunction(torch.autograd.Function):
         ctx.elementwise_affine = W is not None
         ctx.mode = resolved_mode
         ctx.cache_rstd = cache_rstd
+        ctx.reduce_strategy = reduce_strategy
         # Only save what's real. When cache_rstd=False, RSTD is None — we
         # don't want to leak a placeholder tensor through autograd. Backward
         # allocates a fresh placeholder if needed for the kernel signature.
@@ -864,5 +866,6 @@ class FastRMSNormFunction(torch.autograd.Function):
             dY, X, W, RSTD, ctx.eps, ctx.offset, ctx.casting_mode,
             ctx.BLOCK_SIZE, ctx.num_warps, ctx.in_place,
             mode=bwd_mode, row_mode=ctx.row_mode, cache_rstd=ctx.cache_rstd,
+            reduce_strategy=ctx.reduce_strategy,
         )
-        return dX, dW, None, None, None, None, None, None, None
+        return dX, dW, None, None, None, None, None, None, None, None

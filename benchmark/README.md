@@ -41,9 +41,9 @@ Expected v1 result:
 - `FAIL` should be zero before any benchmarking.
 - `gradcheck_fp64` is expected to be `BLOCKED` because the Triton dispatcher
   currently supports fp32/fp16/bf16, not fp64.
-- `reduce_strategy_direct` is expected to be `BLOCKED` until the public API has
-  a debug flag to force atomic vs scratch dweight reduction. The automatic path
-  is still exercised indirectly through the row/block correctness cases.
+- `reduce_strategy_direct` compares `reduce_strategy=auto`, `atomic`, and
+  `scratch` on a block-path shape. Treat any `FAIL` here as a stop sign before
+  trusting reducer ablation timing.
 
 ## Phase 2: Isolation Timing
 
@@ -64,14 +64,34 @@ Phase 2 output includes:
 
 - Environment and run settings.
 - Competitor availability for PyTorch, Forge, Liger, and Unsloth.
+- Source-audited API contracts for each competitor. These document the exact
+  API used, supported semantics, and caveats found from source/docs audit.
 - Capability and fairness-exclusion tables.
 - Separate horizon tables for standard forward, full trainable backward,
   in-place backward speed mode, frozen-gamma `dX`-only backward, folded/no-gamma
-  forward, no-gamma backward, and casting semantics.
+  forward, no-gamma backward, `cache_rstd=False` recompute ablation, reducer
+  ablations, and casting semantics.
+- A `Reducer Policy Comparison` summary that puts Forge auto heuristic, Forge
+  forced atomic, Forge forced scratch/Liger-style, and Liger scratch baseline in
+  one table for safe and in-place backward.
 - Cold-start/autotune timing separated from steady-state CUDA-event timing.
 - Peak steady-state VRAM per row.
 - Estimated FLOPs, bytes moved, GB/s, utilization, and roofline labels.
 - Non-fatal warnings.
+
+The `Cache Ablation: Recompute RSTD Backward` horizon times Forge with
+`cache_rstd=False` and compares it to the cached Forge full-training backward
+row for the same shape in the `vs Cached` column.
+
+The Unsloth direct adapter intentionally uses the audited source API:
+
+```python
+unsloth.kernels.rms_layernorm.fast_rms_layernorm(layernorm, X, gemma=False)
+```
+
+It does not probe random signatures. The direct Unsloth RMSNorm path requires a
+real `layernorm.weight` tensor and its backward returns `dX` only, so it is not
+included in full trainable `dGamma` comparisons.
 
 Results are written under `benchmark/results/`:
 
@@ -120,8 +140,7 @@ the kernel or tolerance bug.
 `BLOCKED` rows
 
 Blocked rows are not silently ignored. They document Forge requirements that are
-not implemented yet. For v1, fp64 gradcheck and forced reduce-strategy comparison
-are known blocked items.
+not implemented yet. For v1, fp64 gradcheck is the known blocked item.
 
 ## Later Phases
 
