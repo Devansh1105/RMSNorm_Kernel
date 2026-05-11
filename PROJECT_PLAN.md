@@ -202,6 +202,13 @@ Implemented files:
   - Forge adapter using `fast_rmsnorm.transformers.rms_norm`
   - Liger adapter using `liger_kernel.ops.LigerRMSNormFunction`
   - Unsloth direct adapter or explicit `NOT_RUN` reason
+- [x] `benchmark/timing/scenarios.py`
+  - horizon definitions for apples-to-apples comparison
+  - full trainable backward, in-place speed mode, frozen-gamma dx-only,
+    folded/no-gamma, no-gamma backward, and casting semantics
+- [x] `benchmark/timing/cold_start.py`
+  - representative cold-start/autotune timing in a fresh subprocess
+  - temporary Triton cache so cold-start is not mixed with steady-state timing
 - [x] `benchmark/timing/profiling.py`
   - estimated FLOPs
   - estimated bytes moved
@@ -213,21 +220,23 @@ Implemented files:
   - Environment
   - Run Settings
   - Competitor Availability
-  - Reference Config
-  - Sequence Sweep
-  - Batch Sweep
-  - Hidden Sweep
-  - QK-Norm Sweep
+  - Capability Matrix
+  - Fairness Exclusions
+  - Cold Start / Autotune
+  - separate steady-state tables per benchmark horizon
   - VRAM
   - Profiling
+  - Path Coverage
   - Warnings
 - [x] `benchmark/scripts/bench_isolation.py`
   - simple CLI with only `--quick` and `--full`
   - no correctness invocation or correctness gating
   - prints a reminder to run Phase 1 separately
   - deterministic seeded inputs built outside timed regions
-  - records forward, forward+backward, and derived backward rows
-  - records `NOT_RUN` rows for missing optional competitors
+  - records horizon-aware forward and derived backward rows
+  - validates expected gradients before timing each adapter/horizon
+  - excludes non-comparable rows from speedup calculations
+  - records `NOT_RUN`, `NOT_COMPARABLE`, and `EXTRA_WORK_REFERENCE` states
   - continues through per-row errors
   - writes JSON and markdown to `benchmark/results/`
 

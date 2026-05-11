@@ -8,7 +8,16 @@ from benchmark.correctness.references import REFERENCES
 
 
 class NotRunnableError(RuntimeError):
-    """Raised when an optional competitor is present but cannot run directly."""
+    """Raised when an optional competitor cannot run a requested operation."""
+
+
+@dataclass(frozen=True)
+class OperationRequest:
+    eps: float
+    offset: float
+    casting_mode: str
+    in_place: bool
+    mode: str
 
 
 class RMSNormAdapter:
@@ -17,18 +26,21 @@ class RMSNormAdapter:
     def available(self) -> tuple[bool, str]:
         raise NotImplementedError
 
-    def forward(self, x, weight, eps, offset, casting_mode):
+    def forward(self, x, weight, request: OperationRequest):
         raise NotImplementedError
 
-    def forward_backward(self, x, weight, grad_out, eps, offset, casting_mode):
+    def backward(self, x, weight, grad_out, request: OperationRequest):
         x.grad = None
         if weight is not None:
             weight.grad = None
-        out = self.forward(x, weight, eps, offset, casting_mode)
+        out = self.forward(x, weight, request)
         import torch
 
         torch.autograd.backward(out, grad_out)
         return out
+
+    def path(self, m: int, n: int, request: OperationRequest) -> str:
+        return "framework"
 
 
 class PyTorchAdapter(RMSNormAdapter):
@@ -37,11 +49,14 @@ class PyTorchAdapter(RMSNormAdapter):
     def available(self) -> tuple[bool, str]:
         return True, "explicit PyTorch formulas"
 
-    def forward(self, x, weight, eps, offset, casting_mode):
-        _, ref_fn = REFERENCES[casting_mode]
+    def forward(self, x, weight, request: OperationRequest):
+        _, ref_fn = REFERENCES[request.casting_mode]
         import torch
 
-        return ref_fn(torch, x, weight, eps, offset)
+        return ref_fn(torch, x, weight, request.eps, request.offset)
+
+    def path(self, m: int, n: int, request: OperationRequest) -> str:
+        return "torch-autograd" if request.mode == "train" else "torch-eager"
 
 
 class ForgeAdapter(RMSNormAdapter):
@@ -65,36 +80,39 @@ class ForgeAdapter(RMSNormAdapter):
                 raise RuntimeError(reason)
         return self._rms_norm
 
-    def forward(self, x, weight, eps, offset, casting_mode):
+    def forward(self, x, weight, request: OperationRequest):
         return self._fn()(
             x,
             weight,
-            eps,
-            offset=offset,
-            casting_mode=casting_mode,
-            in_place=False,
-            mode="infer",
+            request.eps,
+            offset=request.offset,
+            casting_mode=request.casting_mode,
+            in_place=request.in_place,
+            mode=request.mode,
             cache_rstd=True,
         )
 
-    def forward_backward(self, x, weight, grad_out, eps, offset, casting_mode):
-        x.grad = None
-        if weight is not None:
-            weight.grad = None
-        out = self._fn()(
-            x,
-            weight,
-            eps,
-            offset=offset,
-            casting_mode=casting_mode,
-            in_place=False,
-            mode="train",
-            cache_rstd=True,
-        )
-        import torch
+    def path(self, m: int, n: int, request: OperationRequest) -> str:
+        kernel_path = "block" if m >= 32768 and n <= 256 else "row"
+        reduce_strategy = "-"
+        if request.mode == "train":
+            try:
+                import torch
 
-        torch.autograd.backward(out, grad_out)
-        return out
+                from fast_rmsnorm.ops.utils import (
+                    REDUCE_STRATEGY_ATOMIC,
+                    pick_reduce_strategy,
+                )
+
+                sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+                reduce_strategy = (
+                    "atomic"
+                    if pick_reduce_strategy(sm_count, n, torch.device("cuda")) == REDUCE_STRATEGY_ATOMIC.value
+                    else "scratch"
+                )
+            except Exception:
+                reduce_strategy = "unknown"
+        return f"forge-{kernel_path} mode={request.mode} in_place={request.in_place} reduce={reduce_strategy}"
 
 
 class LigerAdapter(RMSNormAdapter):
@@ -118,18 +136,19 @@ class LigerAdapter(RMSNormAdapter):
                 raise NotRunnableError(reason)
         return self._function
 
-    def forward(self, x, weight, eps, offset, casting_mode):
-        return self._fn().apply(x, weight, eps, offset, casting_mode, False)
+    def forward(self, x, weight, request: OperationRequest):
+        return self._fn().apply(
+            x,
+            weight,
+            request.eps,
+            request.offset,
+            request.casting_mode,
+            request.in_place,
+        )
 
-    def forward_backward(self, x, weight, grad_out, eps, offset, casting_mode):
-        x.grad = None
-        if weight is not None:
-            weight.grad = None
-        out = self._fn().apply(x, weight, eps, offset, casting_mode, False)
-        import torch
-
-        torch.autograd.backward(out, grad_out)
-        return out
+    def path(self, m: int, n: int, request: OperationRequest) -> str:
+        kernel_path = "block" if m >= 32768 and n <= 256 else "row"
+        return f"liger-{kernel_path} in_place={request.in_place}"
 
 
 @dataclass
@@ -166,12 +185,12 @@ class UnslothAdapter(RMSNormAdapter):
                 raise NotRunnableError(reason)
         return self._module
 
-    def _call_direct(self, x, weight, eps, offset, casting_mode):
-        if offset != 0.0:
+    def forward(self, x, weight, request: OperationRequest):
+        if request.offset != 0.0:
             raise NotRunnableError("Unsloth direct adapter only supports offset=0.0 in this benchmark")
         module = self._api_module()
-        layernorm = _LayerNormShim(weight=weight, variance_epsilon=eps)
-        gemma = casting_mode == "gemma"
+        layernorm = _LayerNormShim(weight=weight, variance_epsilon=request.eps)
+        gemma = request.casting_mode == "gemma"
         errors = []
 
         for name in ("fast_rms_layernorm", "rms_layernorm"):
@@ -181,7 +200,7 @@ class UnslothAdapter(RMSNormAdapter):
             for args, kwargs in (
                 ((layernorm, x), {"gemma": gemma}),
                 ((layernorm, x), {}),
-                ((x, weight, eps), {}),
+                ((x, weight, request.eps), {}),
             ):
                 try:
                     return fn(*args, **kwargs)
@@ -190,7 +209,7 @@ class UnslothAdapter(RMSNormAdapter):
 
         function = getattr(module, "Fast_RMS_Layernorm", None)
         if function is not None and hasattr(function, "apply"):
-            for args in ((x, weight, eps), (x, weight, eps, gemma)):
+            for args in ((x, weight, request.eps), (x, weight, request.eps, gemma)):
                 try:
                     return function.apply(*args)
                 except Exception as exc:  # noqa: BLE001 - try next known signature.
@@ -199,6 +218,6 @@ class UnslothAdapter(RMSNormAdapter):
         detail = "; ".join(errors[-3:]) if errors else "no known callable found"
         raise NotRunnableError(f"Unsloth direct RMSNorm API incompatible: {detail}")
 
-    def forward(self, x, weight, eps, offset, casting_mode):
-        return self._call_direct(x, weight, eps, offset, casting_mode)
+    def path(self, m: int, n: int, request: OperationRequest) -> str:
+        return "unsloth-direct"
 

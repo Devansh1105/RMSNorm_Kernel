@@ -57,13 +57,19 @@ python -m benchmark.scripts.bench_isolation --full
 
 `--quick` is the Colab/T4 smoke timing path. `--full` runs the reference,
 sequence, batch, hidden, and QK-norm timing sweeps intended for A100/H100.
+The benchmark is split into fair comparison horizons so implementations only
+appear in speedup columns when they do the same work.
 
 Phase 2 output includes:
 
 - Environment and run settings.
 - Competitor availability for PyTorch, Forge, Liger, and Unsloth.
-- Forward, forward+backward, and derived backward timing rows.
-- Peak VRAM per row.
+- Capability and fairness-exclusion tables.
+- Separate horizon tables for standard forward, full trainable backward,
+  in-place backward speed mode, frozen-gamma `dX`-only backward, folded/no-gamma
+  forward, no-gamma backward, and casting semantics.
+- Cold-start/autotune timing separated from steady-state CUDA-event timing.
+- Peak steady-state VRAM per row.
 - Estimated FLOPs, bytes moved, GB/s, utilization, and roofline labels.
 - Non-fatal warnings.
 

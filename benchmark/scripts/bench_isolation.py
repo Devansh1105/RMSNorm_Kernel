@@ -15,33 +15,33 @@ from datetime import datetime
 from pathlib import Path
 
 from benchmark.common.environment import collect_environment, load_torch, require_cuda
+from benchmark.timing.cold_start import measure_cold_start
 from benchmark.timing.competitors import (
     ForgeAdapter,
     LigerAdapter,
     NotRunnableError,
+    OperationRequest,
     PyTorchAdapter,
     RMSNormAdapter,
     UnslothAdapter,
 )
 from benchmark.timing.configs import (
-    DEFAULT_CASTING_MODE,
-    DEFAULT_EPS,
-    DEFAULT_OFFSET,
     DEFAULT_SEED,
-    configs_for_mode,
-    dtype_name,
     dtype_for_device,
+    dtype_name,
     mode_settings,
     peak_for_gpu,
+    quick_configs,
 )
 from benchmark.timing.events import benchmark_kernel, prepare_l2_flush, summarize_samples
 from benchmark.timing.profiling import annotate_row
 from benchmark.timing.reporting import markdown_report, print_report
+from benchmark.timing.scenarios import HORIZONS, Horizon, canary_config, configs_for_horizon, horizon_eps
 
 
 RESULTS_DIR = Path("benchmark/results")
 REQUIRED_ADAPTERS = {"PyTorch", "Forge"}
-PASSES = ("fwd", "fwd_bwd", "bwd_derived")
+STATUSES_WITH_TIMING = {"OK", "EXTRA_WORK_REFERENCE"}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -58,32 +58,171 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _adapter_instances() -> list[RMSNormAdapter]:
+    # Unsloth stays last because importing it can globally patch other libraries.
     return [PyTorchAdapter(), ForgeAdapter(), LigerAdapter(), UnslothAdapter()]
 
 
-def _check_availability(adapters: list[RMSNormAdapter]) -> tuple[dict, list[str]]:
-    availability = {}
-    warnings = []
-    for adapter in adapters:
-        available, reason = adapter.available()
-        availability[adapter.name] = {"available": available, "reason": reason}
-        if not available and adapter.name in REQUIRED_ADAPTERS:
-            raise RuntimeError(f"required adapter {adapter.name} is unavailable: {reason}")
-        if not available:
-            warnings.append(f"{adapter.name} not run: {reason}")
-    return availability, warnings
+def _adapter_availability(adapter: RMSNormAdapter) -> tuple[dict, str | None]:
+    available, reason = adapter.available()
+    if not available and adapter.name in REQUIRED_ADAPTERS:
+        raise RuntimeError(f"required adapter {adapter.name} is unavailable: {reason}")
+    warning = None if available else f"{adapter.name} not run: {reason}"
+    return {"available": available, "reason": reason}, warning
 
 
-def _base_row(config, framework: str, pass_name: str, dtype: str, status: str = "OK", notes: str = "") -> dict:
+def _request_for_horizon(horizon: Horizon) -> OperationRequest:
+    return OperationRequest(
+        eps=horizon_eps(horizon),
+        offset=horizon.offset,
+        casting_mode=horizon.casting_mode,
+        in_place=horizon.in_place,
+        mode="train" if horizon.is_backward else "infer",
+    )
+
+
+def _shape_text(shape: dict) -> str:
+    if shape.get("batch") is not None and shape.get("seq") is not None:
+        return f"b{shape['batch']} s{shape['seq']} h{shape['n']}"
+    return f"m{shape['m']} n{shape['n']}"
+
+
+def _seed_for(horizon: Horizon, config_index: int) -> int:
+    return DEFAULT_SEED + config_index + (sum(ord(ch) for ch in horizon.id) % 10000)
+
+
+def _make_inputs(torch, config, dtype, horizon: Horizon):
+    x = torch.randn((config.m, config.n), device="cuda", dtype=dtype)
+    weight = None if horizon.weight_mode == "no_gamma" else torch.randn((config.n,), device="cuda", dtype=dtype)
+    grad_out = torch.randn((config.m, config.n), device="cuda", dtype=dtype)
+    if horizon.is_backward:
+        x = x.detach().clone().requires_grad_(True)
+        if weight is not None and horizon.weight_mode == "trainable_gamma":
+            weight = weight.detach().clone().requires_grad_(True)
+        elif weight is not None:
+            weight = weight.detach().clone()
+    return x, weight, grad_out
+
+
+def _observed_grads(x, weight) -> tuple[str, ...]:
+    observed = []
+    if getattr(x, "grad", None) is not None:
+        observed.append("x")
+    if weight is not None and getattr(weight, "grad", None) is not None:
+        observed.append("gamma")
+    return tuple(observed)
+
+
+def _canary_status(torch, adapter: RMSNormAdapter, horizon: Horizon, dtype) -> dict:
+    from benchmark.correctness.references import REFERENCES
+
+    config = canary_config()
+    request = _request_for_horizon(horizon)
+    x, weight, grad_out = _make_inputs(torch, config, dtype, horizon)
+    try:
+        if horizon.is_backward:
+            out = adapter.backward(x, weight, grad_out, request)
+        else:
+            with torch.no_grad():
+                out = adapter.forward(x, weight, request)
+        torch.cuda.synchronize()
+    except NotRunnableError as exc:
+        return {"status": "NOT_RUN", "observed_grads": (), "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - canary failures are reported, not raised.
+        return {"status": "ERROR", "observed_grads": (), "reason": f"{type(exc).__name__}: {exc}"}
+
+    _, ref_fn = REFERENCES[horizon.casting_mode]
+    ref = ref_fn(torch, x.detach(), weight.detach() if weight is not None else None, horizon_eps(horizon), horizon.offset)
+    max_abs = float((out.detach() - ref).abs().max().detach().cpu())
+    if max_abs > 5e-2:
+        return {
+            "status": "NOT_COMPARABLE",
+            "observed_grads": _observed_grads(x, weight),
+            "reason": f"forward semantic canary mismatch max_abs={max_abs:.3e}",
+        }
+
+    observed = _observed_grads(x, weight)
+    expected = set(horizon.expected_grads)
+    missing = expected.difference(observed)
+    unexpected_gamma = horizon.operation == "backward_dx_only" and "gamma" in observed
+    if missing:
+        return {
+            "status": "NOT_COMPARABLE",
+            "observed_grads": observed,
+            "reason": "missing " + ",".join(sorted(missing)),
+        }
+    if unexpected_gamma:
+        return {
+            "status": "NOT_COMPARABLE",
+            "observed_grads": observed,
+            "reason": "unexpected gamma grad in dx-only horizon",
+        }
+    return {"status": "OK", "observed_grads": observed, "reason": ""}
+
+
+def _should_attempt(adapter: RMSNormAdapter, horizon: Horizon) -> bool:
+    if adapter.name in horizon.eligible or adapter.name in horizon.include_extra_work:
+        return True
+    if adapter.name == "Unsloth" and horizon.id in {
+        "full_training_backward_safe",
+        "folded_gamma_forward_no_gamma",
+        "no_gamma_backward_dx_only",
+    }:
+        return True
+    return False
+
+
+def _role_for(adapter: RMSNormAdapter, horizon: Horizon, canary: dict) -> tuple[str, bool, str]:
+    if adapter.name in horizon.include_extra_work and canary["status"] == "OK":
+        return "EXTRA_WORK_REFERENCE", False, "extra_dGamma_work"
+    if adapter.name in horizon.eligible and canary["status"] == "OK":
+        return "OK", True, ""
+    if adapter.name == "Unsloth" and horizon.id == "full_training_backward_safe" and canary["status"] == "OK":
+        return "OK", True, ""
+    if adapter.name == "Unsloth" and horizon.id in {
+        "folded_gamma_forward_no_gamma",
+        "no_gamma_backward_dx_only",
+    } and canary["status"] == "OK":
+        return "OK", True, ""
+    return canary["status"], False, canary["reason"]
+
+
+def _base_row(
+    config,
+    horizon: Horizon,
+    adapter: RMSNormAdapter,
+    dtype_text: str,
+    *,
+    status: str,
+    included: bool,
+    exclusion_reason: str = "",
+    observed_grads: tuple[str, ...] = (),
+    notes: str = "",
+) -> dict:
+    request = _request_for_horizon(horizon)
     return {
+        "horizon_id": horizon.id,
+        "horizon_name": horizon.name,
+        "horizon_description": horizon.description,
+        "shape_group": config.sweep,
         "sweep": config.sweep,
-        "framework": framework,
-        "pass": pass_name,
+        "framework": adapter.name,
+        "pass": "bwd_derived" if horizon.is_backward else "fwd",
+        "operation": horizon.operation,
         "shape": config.shape,
-        "dtype": dtype,
-        "casting_mode": DEFAULT_CASTING_MODE,
-        "offset": DEFAULT_OFFSET,
+        "shape_text": _shape_text(config.shape),
+        "dtype": dtype_text,
+        "casting_mode": horizon.casting_mode,
+        "offset": horizon.offset,
+        "eps": horizon_eps(horizon),
+        "weight_mode": horizon.weight_mode,
+        "in_place": horizon.in_place,
+        "expected_grads": list(horizon.expected_grads),
+        "observed_grads": list(observed_grads),
+        "included_in_speedup": included,
+        "exclusion_reason": exclusion_reason,
         "stats_ms": {},
+        "fwd_bwd_stats_ms": {},
+        "forward_baseline_stats_ms": {},
         "vram_bytes": 0,
         "flops": 0,
         "bytes": 0,
@@ -91,122 +230,275 @@ def _base_row(config, framework: str, pass_name: str, dtype: str, status: str = 
         "gbps": None,
         "peak_utilization_pct": None,
         "roofline": "unknown",
+        "speedup_vs_pytorch": None,
+        "speedup_vs_liger": None,
+        "path": adapter.path(int(config.m), int(config.n), request),
         "status": status,
         "notes": notes,
     }
-
-
-def _not_run_rows(config, adapter: RMSNormAdapter, dtype: str, reason: str) -> list[dict]:
-    return [_base_row(config, adapter.name, pass_name, dtype, status="NOT_RUN", notes=reason) for pass_name in PASSES]
 
 
 def _error_text(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def _measure_cuda_peak(torch, fn, warmup: int, runs: int) -> tuple[dict, int]:
+def _measure_steady(torch, fn, warmup: int, runs: int) -> tuple[dict, int]:
     prepare_l2_flush(torch)
+    for _ in range(warmup):
+        fn()
     torch.cuda.synchronize()
     baseline = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    stats = benchmark_kernel(fn, warmup, runs)
+    stats = benchmark_kernel(fn, 0, runs)
     torch.cuda.synchronize()
     peak = max(int(torch.cuda.max_memory_allocated() - baseline), 0)
     return stats, peak
 
 
-def _timed_row(torch, config, adapter: RMSNormAdapter, dtype: str, pass_name: str, fn, warmup: int, runs: int) -> dict:
-    row = _base_row(config, adapter.name, pass_name, dtype)
+def _grad_pool(torch, grad_out, count: int) -> list:
+    return [grad_out.detach().clone() for _ in range(count)]
+
+
+def _run_forward_row(torch, config, horizon, adapter, dtype_text, x, weight, warmup, runs, status, included, reason, observed):
+    row = _base_row(
+        config,
+        horizon,
+        adapter,
+        dtype_text,
+        status=status,
+        included=included,
+        exclusion_reason=reason,
+        observed_grads=observed,
+    )
+    if status not in STATUSES_WITH_TIMING:
+        return row, None
+    request = _request_for_horizon(horizon)
+
+    def fn():
+        with torch.no_grad():
+            return adapter.forward(x, weight, request)
+
     try:
-        stats, peak = _measure_cuda_peak(torch, fn, warmup, runs)
+        stats, peak = _measure_steady(torch, fn, warmup, runs)
         row.update({"stats_ms": stats, "vram_bytes": peak})
     except NotRunnableError as exc:
-        row.update({"status": "NOT_RUN", "notes": str(exc)})
-    except Exception as exc:  # noqa: BLE001 - benchmark should keep going by row.
-        row.update({"status": "ERROR", "notes": _error_text(exc)})
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            pass
-    return row
-
-
-def _derived_row(config, adapter: RMSNormAdapter, dtype: str, fwd_row: dict, fwd_bwd_row: dict) -> tuple[dict, str | None]:
-    row = _base_row(config, adapter.name, "bwd_derived", dtype)
-    if fwd_row["status"] != "OK" or fwd_bwd_row["status"] != "OK":
-        status = "NOT_RUN" if "NOT_RUN" in {fwd_row["status"], fwd_bwd_row["status"]} else "ERROR"
-        notes = f"requires OK fwd and fwd_bwd rows; got fwd={fwd_row['status']} fwd_bwd={fwd_bwd_row['status']}"
-        row.update({"status": status, "notes": notes})
-        return row, None
-
-    fwd_samples = (fwd_row.get("stats_ms") or {}).get("samples") or []
-    fwd_bwd_samples = (fwd_bwd_row.get("stats_ms") or {}).get("samples") or []
-    if len(fwd_samples) == len(fwd_bwd_samples) and fwd_samples:
-        samples = [bwd - fwd for fwd, bwd in zip(fwd_samples, fwd_bwd_samples)]
-    else:
-        samples = [
-            (fwd_bwd_row.get("stats_ms") or {}).get("mean", 0.0)
-            - (fwd_row.get("stats_ms") or {}).get("mean", 0.0)
-        ]
-
-    stats = summarize_samples(samples)
-    row.update({"stats_ms": stats, "vram_bytes": fwd_bwd_row.get("vram_bytes", 0)})
-    if (stats.get("mean") is not None and stats["mean"] < 0) or (stats.get("median") is not None and stats["median"] < 0):
-        warning = f"derived backward time is negative due to noise: {adapter.name} {config.label}"
-        row["notes"] = "negative derived latency; timing noise"
-        return row, warning
+        row.update({"status": "NOT_RUN", "included_in_speedup": False, "exclusion_reason": str(exc), "notes": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - benchmark should continue by row.
+        row.update({"status": "ERROR", "included_in_speedup": False, "exclusion_reason": _error_text(exc), "notes": _error_text(exc)})
     return row, None
 
 
-def _make_inputs(torch, config, dtype):
-    x = torch.randn((config.m, config.n), device="cuda", dtype=dtype)
-    weight = torch.randn((config.n,), device="cuda", dtype=dtype)
-    x_bwd = x.detach().clone().requires_grad_(True)
-    weight_bwd = weight.detach().clone().requires_grad_(True)
-    grad_out = torch.randn((config.m, config.n), device="cuda", dtype=dtype)
-    return x, weight, x_bwd, weight_bwd, grad_out
+def _run_backward_row(torch, config, horizon, adapter, dtype_text, x, weight, grad_out, warmup, runs, status, included, reason, observed):
+    row = _base_row(
+        config,
+        horizon,
+        adapter,
+        dtype_text,
+        status=status,
+        included=included,
+        exclusion_reason=reason,
+        observed_grads=observed,
+    )
+    if status not in STATUSES_WITH_TIMING:
+        return row, None
+
+    request = _request_for_horizon(horizon)
+    grad_pool = _grad_pool(torch, grad_out, warmup + runs + 2)
+    grad_index = {"value": 0}
+
+    def fwd_fn():
+        with torch.no_grad():
+            return adapter.forward(x.detach(), weight, request)
+
+    def fwd_bwd_fn():
+        idx = grad_index["value"]
+        grad_index["value"] += 1
+        return adapter.backward(x, weight, grad_pool[idx], request)
+
+    try:
+        fwd_stats, _ = _measure_steady(torch, fwd_fn, warmup, runs)
+        fwd_bwd_stats, peak = _measure_steady(torch, fwd_bwd_fn, warmup, runs)
+        fwd_samples = fwd_stats.get("samples") or []
+        fwd_bwd_samples = fwd_bwd_stats.get("samples") or []
+        if len(fwd_samples) == len(fwd_bwd_samples) and fwd_samples:
+            samples = [bwd - fwd for fwd, bwd in zip(fwd_samples, fwd_bwd_samples)]
+        else:
+            samples = [(fwd_bwd_stats.get("mean") or 0.0) - (fwd_stats.get("mean") or 0.0)]
+        stats = summarize_samples(samples)
+        row.update(
+            {
+                "stats_ms": stats,
+                "fwd_bwd_stats_ms": fwd_bwd_stats,
+                "forward_baseline_stats_ms": fwd_stats,
+                "vram_bytes": peak,
+            }
+        )
+        if (stats.get("mean") is not None and stats["mean"] < 0) or (
+            stats.get("median") is not None and stats["median"] < 0
+        ):
+            warning = f"derived backward time is negative due to noise: {adapter.name} {horizon.name} {config.label}"
+            row["notes"] = "negative derived latency; timing noise"
+            return row, warning
+    except NotRunnableError as exc:
+        row.update({"status": "NOT_RUN", "included_in_speedup": False, "exclusion_reason": str(exc), "notes": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - benchmark should continue by row.
+        row.update({"status": "ERROR", "included_in_speedup": False, "exclusion_reason": _error_text(exc), "notes": _error_text(exc)})
+    return row, None
 
 
-def _run_config(torch, config, adapters, availability: dict, dtype, dtype_text: str, warmup: int, runs: int) -> tuple[list[dict], list[str]]:
+def _run_adapter_horizon(torch, adapter, horizon, availability, dtype, dtype_text, warmup, runs):
     rows = []
+    exclusions = []
     warnings = []
-    x, weight, x_bwd, weight_bwd, grad_out = _make_inputs(torch, config, dtype)
+    if not availability["available"]:
+        exclusions.append(
+            {
+                "horizon_id": horizon.id,
+                "horizon_name": horizon.name,
+                "framework": adapter.name,
+                "reason": availability["reason"],
+                "status": "NOT_RUN",
+            }
+        )
+        return rows, exclusions, warnings, {"status": "NOT_RUN", "observed_grads": (), "reason": availability["reason"]}
 
-    for adapter in adapters:
-        adapter_availability = availability[adapter.name]
-        if not adapter_availability["available"]:
-            rows.extend(_not_run_rows(config, adapter, dtype_text, adapter_availability["reason"]))
-            continue
+    if not _should_attempt(adapter, horizon):
+        reason = "not eligible for this horizon"
+        exclusions.append(
+            {
+                "horizon_id": horizon.id,
+                "horizon_name": horizon.name,
+                "framework": adapter.name,
+                "reason": reason,
+                "status": "NOT_COMPARABLE",
+            }
+        )
+        return rows, exclusions, warnings, {"status": "NOT_COMPARABLE", "observed_grads": (), "reason": reason}
 
-        def fwd_fn(adapter=adapter):
-            with torch.no_grad():
-                return adapter.forward(x, weight, DEFAULT_EPS, DEFAULT_OFFSET, DEFAULT_CASTING_MODE)
+    canary = _canary_status(torch, adapter, horizon, dtype)
+    status, included, reason = _role_for(adapter, horizon, canary)
+    if status not in STATUSES_WITH_TIMING:
+        exclusions.append(
+            {
+                "horizon_id": horizon.id,
+                "horizon_name": horizon.name,
+                "framework": adapter.name,
+                "reason": reason,
+                "status": status,
+                "observed_grads": list(canary.get("observed_grads") or ()),
+                "expected_grads": list(horizon.expected_grads),
+            }
+        )
 
-        def fwd_bwd_fn(adapter=adapter):
-            return adapter.forward_backward(
-                x_bwd,
-                weight_bwd,
+    for config_index, config in enumerate(configs_for_horizon("full" if runs > 3 else "quick", horizon)):
+        torch.manual_seed(_seed_for(horizon, config_index))
+        torch.cuda.manual_seed_all(_seed_for(horizon, config_index))
+        x, weight, grad_out = _make_inputs(torch, config, dtype, horizon)
+        if horizon.is_backward:
+            row, warning = _run_backward_row(
+                torch,
+                config,
+                horizon,
+                adapter,
+                dtype_text,
+                x,
+                weight,
                 grad_out,
-                DEFAULT_EPS,
-                DEFAULT_OFFSET,
-                DEFAULT_CASTING_MODE,
+                warmup,
+                runs,
+                status,
+                included,
+                reason,
+                tuple(canary.get("observed_grads") or ()),
             )
-
-        fwd_row = _timed_row(torch, config, adapter, dtype_text, "fwd", fwd_fn, warmup, runs)
-        rows.append(fwd_row)
-        fwd_bwd_row = _timed_row(torch, config, adapter, dtype_text, "fwd_bwd", fwd_bwd_fn, warmup, runs)
-        rows.append(fwd_bwd_row)
-        derived_row, warning = _derived_row(config, adapter, dtype_text, fwd_row, fwd_bwd_row)
-        rows.append(derived_row)
+        else:
+            row, warning = _run_forward_row(
+                torch,
+                config,
+                horizon,
+                adapter,
+                dtype_text,
+                x,
+                weight,
+                warmup,
+                runs,
+                status,
+                included,
+                reason,
+                tuple(canary.get("observed_grads") or ()),
+            )
+        rows.append(row)
         if warning:
             warnings.append(warning)
-        x_bwd.grad = None
-        weight_bwd.grad = None
+        del x, weight, grad_out
+        gc.collect()
+        torch.cuda.empty_cache()
+    return rows, exclusions, warnings, canary
 
-    del x, weight, x_bwd, weight_bwd, grad_out
-    gc.collect()
-    torch.cuda.empty_cache()
-    return rows, warnings
+
+def _add_speedups(rows: list[dict]) -> None:
+    groups = {}
+    for row in rows:
+        key = (row["horizon_id"], row["shape_text"], row["casting_mode"])
+        groups.setdefault(key, []).append(row)
+
+    for group_rows in groups.values():
+        baselines = {}
+        for row in group_rows:
+            if not row.get("included_in_speedup") or row.get("status") != "OK":
+                continue
+            median = (row.get("stats_ms") or {}).get("median")
+            if median and median > 0 and row["framework"] in {"PyTorch", "Liger"}:
+                baselines[row["framework"]] = median
+        for row in group_rows:
+            median = (row.get("stats_ms") or {}).get("median")
+            if not median or median <= 0 or not row.get("included_in_speedup"):
+                continue
+            if baselines.get("PyTorch"):
+                row["speedup_vs_pytorch"] = baselines["PyTorch"] / median
+            if baselines.get("Liger"):
+                row["speedup_vs_liger"] = baselines["Liger"] / median
+
+
+def _folding_canary(torch, dtype) -> dict:
+    from benchmark.correctness.references import rms_norm_llama
+
+    torch.manual_seed(DEFAULT_SEED + 999)
+    x = torch.randn((4, 16), device="cuda", dtype=dtype)
+    gamma = torch.randn((16,), device="cuda", dtype=dtype)
+    linear = torch.randn((8, 16), device="cuda", dtype=dtype)
+    eps = 1e-6
+    pre = rms_norm_llama(torch, x, gamma, eps, 0.0) @ linear.t()
+    folded_linear = linear * gamma[None, :]
+    post = rms_norm_llama(torch, x, None, eps, 0.0) @ folded_linear.t()
+    max_abs = float((pre - post).abs().max().detach().cpu())
+    return {"status": "PASS" if max_abs < 5e-2 else "WARN", "max_abs": max_abs}
+
+
+def _cold_start_rows(mode: str) -> list[dict]:
+    configs = quick_configs()
+    reference = configs[0]
+    qk = configs[1]
+    targets = [
+        ("Forge", "standard_forward_affine", reference),
+        ("Liger", "standard_forward_affine", reference),
+        ("Forge", "full_training_backward_safe", qk),
+        ("Liger", "full_training_backward_safe", qk),
+    ]
+    rows = []
+    for adapter, horizon_id, config in targets:
+        payload = measure_cold_start(adapter, horizon_id, config.m, config.n)
+        payload.update(
+            {
+                "mode": mode,
+                "horizon_id": horizon_id,
+                "shape": config.shape,
+                "shape_text": _shape_text(config.shape),
+                "framework": adapter,
+            }
+        )
+        rows.append(payload)
+    return rows
 
 
 def _slug(value: str) -> str:
@@ -242,33 +534,56 @@ def run(args: argparse.Namespace) -> int:
     peak = peak_for_gpu(env["gpu"])
 
     adapters = _adapter_instances()
-    availability, warnings = _check_availability(adapters)
+    availability = {}
+    warnings = []
+    results = []
+    exclusions = []
+    capability_matrix = []
+
     if peak.get("bandwidth_gbps") is None:
         warnings.append(f"unknown GPU peak bandwidth for {env['gpu']}; utilization fields will be '-'")
 
-    results = []
-    for config in configs_for_mode(mode):
-        config_rows, config_warnings = _run_config(
-            torch,
-            config,
-            adapters,
-            availability,
-            dtype,
-            dtype_text,
-            warmup,
-            runs,
-        )
-        results.extend(config_rows)
-        warnings.extend(config_warnings)
+    for adapter in adapters:
+        adapter_availability, availability_warning = _adapter_availability(adapter)
+        availability[adapter.name] = adapter_availability
+        if availability_warning:
+            warnings.append(availability_warning)
+
+        for horizon in HORIZONS:
+            rows, horizon_exclusions, horizon_warnings, canary = _run_adapter_horizon(
+                torch,
+                adapter,
+                horizon,
+                adapter_availability,
+                dtype,
+                dtype_text,
+                warmup,
+                runs,
+            )
+            results.extend(rows)
+            exclusions.extend(horizon_exclusions)
+            warnings.extend(horizon_warnings)
+            capability_matrix.append(
+                {
+                    "framework": adapter.name,
+                    "horizon_id": horizon.id,
+                    "horizon_name": horizon.name,
+                    "status": canary["status"],
+                    "expected_grads": list(horizon.expected_grads),
+                    "observed_grads": list(canary.get("observed_grads") or ()),
+                    "reason": canary.get("reason", ""),
+                }
+            )
 
     for row in results:
         annotate_row(row, peak)
-        if row.get("status") == "OK" and peak.get("bandwidth_gbps") and row.get("gbps"):
+        if row.get("status") in STATUSES_WITH_TIMING and peak.get("bandwidth_gbps") and row.get("gbps"):
             if row["gbps"] > peak["bandwidth_gbps"]:
                 warnings.append(
-                    f"measured GB/s above configured peak: {row['framework']} {row['pass']} "
-                    f"{row['sweep']} {row['gbps']:.1f} > {peak['bandwidth_gbps']:.1f}"
+                    f"measured GB/s above configured peak: {row['framework']} {row['horizon_name']} "
+                    f"{row['shape_text']} {row['gbps']:.1f} > {peak['bandwidth_gbps']:.1f}"
                 )
+    _add_speedups(results)
 
     report = {
         "environment": env,
@@ -279,15 +594,25 @@ def run(args: argparse.Namespace) -> int:
         "competitor_availability": availability,
         "settings": {
             "seed": DEFAULT_SEED,
-            "eps": DEFAULT_EPS,
-            "casting_mode": DEFAULT_CASTING_MODE,
-            "offset": DEFAULT_OFFSET,
-            "backward_in_place": False,
             "peak_profile": peak["name"],
             "peak_bandwidth_gbps": peak["bandwidth_gbps"],
             "peak_fp16_tflops": peak["fp16_tflops"],
             "peak_bf16_tflops": peak["bf16_tflops"],
         },
+        "horizons": [
+            {
+                "id": horizon.id,
+                "name": horizon.name,
+                "description": horizon.description,
+                "eligible": list(horizon.eligible),
+                "include_extra_work": list(horizon.include_extra_work),
+            }
+            for horizon in HORIZONS
+        ],
+        "capability_matrix": capability_matrix,
+        "fairness_exclusions": exclusions,
+        "folding_canary": _folding_canary(torch, dtype),
+        "cold_start": _cold_start_rows(mode),
         "results": results,
         "warnings": list(dict.fromkeys(warnings)),
     }

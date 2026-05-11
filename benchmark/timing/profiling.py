@@ -10,7 +10,15 @@ def dtype_size_bytes(dtype_name: str) -> int:
     return 2
 
 
-def estimate_work(pass_name: str, m: int, n: int, dtype_name: str) -> tuple[int, int]:
+def estimate_work(
+    pass_name: str,
+    m: int,
+    n: int,
+    dtype_name: str,
+    *,
+    weight_mode: str = "affine",
+    expected_grads: tuple[str, ...] = ("x", "gamma"),
+) -> tuple[int, int]:
     """Return estimated FLOPs and bytes moved.
 
     These are interpretation estimates, not hardware profiler counters.
@@ -19,22 +27,24 @@ def estimate_work(pass_name: str, m: int, n: int, dtype_name: str) -> tuple[int,
     elements = m * n
 
     fwd_flops = 2 * elements
-    fwd_bytes = elements * element_size + n * element_size + elements * element_size
+    has_weight = weight_mode != "no_gamma"
+    fwd_bytes = elements * element_size + (n * element_size if has_weight else 0) + elements * element_size
 
-    bwd_flops = 6 * elements
+    computes_gamma_grad = "gamma" in expected_grads
+    bwd_flops = (6 if computes_gamma_grad else 5) * elements
     bwd_bytes = (
         elements * element_size  # x read
         + elements * element_size  # dy read
-        + n * element_size  # weight read
+        + (n * element_size if has_weight else 0)  # weight read
         + elements * element_size  # dx write
-        + n * 4  # dweight write / partial reduction estimate
+        + (n * 4 if computes_gamma_grad else 0)  # dweight write / partial reduction estimate
     )
 
     if pass_name == "fwd":
         return fwd_flops, fwd_bytes
     if pass_name == "fwd_bwd":
         return fwd_flops + bwd_flops, fwd_bytes + bwd_bytes
-    if pass_name == "bwd_derived":
+    if pass_name in {"bwd_derived", "backward"}:
         return bwd_flops, bwd_bytes
     raise ValueError(f"unknown pass: {pass_name}")
 
@@ -48,7 +58,7 @@ def _peak_tflops(dtype_name: str, peak: dict) -> float | None:
 
 
 def annotate_row(row: dict, peak: dict) -> None:
-    if row.get("status") != "OK":
+    if row.get("status") not in {"OK", "EXTRA_WORK_REFERENCE"}:
         row.update(
             {
                 "flops": 0,
@@ -62,7 +72,14 @@ def annotate_row(row: dict, peak: dict) -> None:
         return
 
     shape = row["shape"]
-    flops, bytes_moved = estimate_work(row["pass"], int(shape["m"]), int(shape["n"]), row["dtype"])
+    flops, bytes_moved = estimate_work(
+        row["pass"],
+        int(shape["m"]),
+        int(shape["n"]),
+        row["dtype"],
+        weight_mode=row.get("weight_mode", "affine"),
+        expected_grads=tuple(row.get("expected_grads") or ("x", "gamma")),
+    )
     stats = row.get("stats_ms") or {}
     latency_ms = stats.get("median") or stats.get("mean")
     arithmetic_intensity = flops / bytes_moved if bytes_moved else None
@@ -93,4 +110,3 @@ def annotate_row(row: dict, peak: dict) -> None:
             "roofline": roofline,
         }
     )
-

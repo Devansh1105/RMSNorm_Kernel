@@ -4,35 +4,24 @@ from __future__ import annotations
 from benchmark.common.table import format_float, print_section, print_table
 
 
-SWEEP_TITLES = {
-    "reference": "Reference Config",
-    "seq": "Sequence Sweep",
-    "batch": "Batch Sweep",
-    "hidden": "Hidden Sweep",
-    "qk_norm": "QK-Norm Sweep",
-}
-
-
-def _value(value, default: str = "-") -> str:
-    if value is None:
-        return default
-    return str(value)
+TIMED_STATUSES = {"OK", "EXTRA_WORK_REFERENCE"}
 
 
 def _shape_text(shape: dict) -> str:
-    batch = shape.get("batch")
-    seq = shape.get("seq")
-    m = shape.get("m")
-    n = shape.get("n")
-    if batch is not None and seq is not None:
-        return f"b{batch} s{seq} h{n}"
-    return f"m{m} n{n}"
+    if shape.get("batch") is not None and shape.get("seq") is not None:
+        return f"b{shape['batch']} s{shape['seq']} h{shape['n']}"
+    return f"m{shape['m']} n{shape['n']}"
 
 
 def _latency(row: dict, key: str = "median") -> str:
-    if row.get("status") != "OK":
+    if not row.get("stats_ms"):
         return "-"
     return format_float((row.get("stats_ms") or {}).get(key))
+
+
+def _speedup(row: dict, key: str) -> str:
+    value = row.get(key)
+    return "-" if value is None else f"{value:.3f}x"
 
 
 def _bytes(value) -> str:
@@ -53,53 +42,119 @@ def _availability_rows(availability: dict) -> list[list[object]]:
     ]
 
 
-def _timing_rows(rows: list[dict], sweep: str) -> list[list[object]]:
-    selected = [row for row in rows if row.get("sweep") == sweep]
+def _capability_rows(report: dict) -> list[list[object]]:
     return [
         [
+            item["framework"],
+            item["horizon_name"],
+            item["status"],
+            ",".join(item.get("expected_grads") or ()) or "-",
+            ",".join(item.get("observed_grads") or ()) or "-",
+            item.get("reason") or "",
+        ]
+        for item in report.get("capability_matrix", [])
+    ]
+
+
+def _exclusion_rows(report: dict) -> list[list[object]]:
+    return [
+        [
+            item["framework"],
+            item["horizon_name"],
+            item["status"],
+            item.get("reason") or "",
+            ",".join(item.get("expected_grads") or ()) or "-",
+            ",".join(item.get("observed_grads") or ()) or "-",
+        ]
+        for item in report.get("fairness_exclusions", [])
+    ]
+
+
+def _cold_start_rows(report: dict) -> list[list[object]]:
+    rows = []
+    horizon_names = {item["id"]: item["name"] for item in report.get("horizons", [])}
+    for row in report.get("cold_start", []):
+        rows.append(
+            [
+                horizon_names.get(row["horizon_id"], row["horizon_id"]),
+                row["framework"],
+                row.get("shape_text") or _shape_text(row["shape"]),
+                row["status"],
+                format_float(row.get("elapsed_ms")),
+                _bytes(row.get("vram_bytes")) if row.get("status") == "OK" else "-",
+                row.get("notes") or "",
+            ]
+        )
+    return rows
+
+
+def _horizon_rows(report: dict, horizon_id: str) -> list[list[object]]:
+    selected = [row for row in report["results"] if row["horizon_id"] == horizon_id]
+    return [
+        [
+            row.get("shape_text") or _shape_text(row["shape"]),
             row["framework"],
-            row["pass"],
-            _shape_text(row["shape"]),
             row["status"],
             _latency(row, "median"),
             _latency(row, "p95"),
-            format_float(row.get("gbps")) if row.get("status") == "OK" else "-",
-            format_float(row.get("peak_utilization_pct")) if row.get("status") == "OK" else "-",
-            row.get("notes") or "",
+            _speedup(row, "speedup_vs_pytorch"),
+            _speedup(row, "speedup_vs_liger"),
+            format_float(row.get("gbps")) if row.get("status") in TIMED_STATUSES else "-",
+            format_float(row.get("peak_utilization_pct")) if row.get("status") in TIMED_STATUSES else "-",
+            ",".join(row.get("observed_grads") or ()) or "-",
+            row.get("path") or "-",
+            row.get("exclusion_reason") or row.get("notes") or "",
         ]
         for row in selected
     ]
 
 
-def _vram_rows(rows: list[dict]) -> list[list[object]]:
+def _vram_rows(report: dict, horizon_id: str) -> list[list[object]]:
     return [
         [
-            row["sweep"],
+            row.get("shape_text") or _shape_text(row["shape"]),
             row["framework"],
-            row["pass"],
-            _shape_text(row["shape"]),
             row["status"],
-            _bytes(row.get("vram_bytes")) if row.get("status") == "OK" else "-",
+            _bytes(row.get("vram_bytes")) if row.get("status") in TIMED_STATUSES else "-",
+            row.get("exclusion_reason") or "",
         ]
-        for row in rows
+        for row in report["results"]
+        if row["horizon_id"] == horizon_id
     ]
 
 
-def _profiling_rows(rows: list[dict]) -> list[list[object]]:
+def _profiling_rows(report: dict) -> list[list[object]]:
     return [
         [
-            row["sweep"],
+            row["horizon_name"],
+            row.get("shape_text") or _shape_text(row["shape"]),
             row["framework"],
-            row["pass"],
-            _shape_text(row["shape"]),
             format_float(row.get("arithmetic_intensity")),
             format_float(row.get("gbps")),
             format_float(row.get("peak_utilization_pct")),
             row.get("roofline", "unknown"),
         ]
-        for row in rows
-        if row.get("status") == "OK"
+        for row in report["results"]
+        if row.get("status") in TIMED_STATUSES
     ]
+
+
+def _path_rows(report: dict) -> list[list[object]]:
+    seen = set()
+    rows = []
+    for row in report["results"]:
+        key = (row["horizon_name"], row["framework"], row.get("shape_group"), row.get("path"))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append([row["horizon_name"], row["framework"], row.get("shape_group"), row.get("path")])
+    return rows
+
+
+def _horizon_meta(horizon: dict) -> str:
+    eligible = ", ".join(horizon.get("eligible") or ()) or "-"
+    extra = ", ".join(horizon.get("include_extra_work") or ()) or "-"
+    return f"Measures: {horizon['description']} | Eligible: {eligible} | Extra-work references: {extra}"
 
 
 def print_report(report: dict) -> None:
@@ -132,26 +187,57 @@ def print_report(report: dict) -> None:
             ["Warmup", report["warmup"]],
             ["Runs", report["runs"]],
             ["Seed", settings["seed"]],
-            ["Casting Mode", settings["casting_mode"]],
-            ["Offset", settings["offset"]],
-            ["Eps", settings["eps"]],
-            ["Backward in_place", settings["backward_in_place"]],
+            ["Steady State", "CUDA events after warmup/autotune"],
+            ["Cold Start", "fresh subprocess with temporary Triton cache"],
         ],
     )
 
     print_section("Competitor Availability")
     print_table(["Framework", "Status", "Notes"], _availability_rows(report["competitor_availability"]))
 
-    headers = ["Framework", "Pass", "Shape", "Status", "Median ms", "P95 ms", "GB/s", "Peak %", "Notes"]
-    for sweep, title in SWEEP_TITLES.items():
-        print_section(title)
-        print_table(headers, _timing_rows(report["results"], sweep))
+    print_section("Capability Matrix")
+    print_table(["Framework", "Horizon", "Status", "Expected", "Observed", "Reason"], _capability_rows(report))
+
+    print_section("Fairness Exclusions")
+    print_table(["Framework", "Horizon", "Status", "Reason", "Expected", "Observed"], _exclusion_rows(report))
+
+    print_section("Folding Canary")
+    folding = report.get("folding_canary", {})
+    print_table(["Status", "Max Abs"], [[folding.get("status", "-"), format_float(folding.get("max_abs"))]])
+
+    print_section("Cold Start / Autotune")
+    print_table(["Horizon", "Framework", "Shape", "Status", "Elapsed ms", "Peak", "Notes"], _cold_start_rows(report))
+
+    print_section("Steady-State Timing")
+    headers = [
+        "Shape",
+        "Framework",
+        "Status",
+        "Median ms",
+        "P95 ms",
+        "vs PyTorch",
+        "vs Liger",
+        "GB/s",
+        "Peak %",
+        "Observed",
+        "Path",
+        "Notes",
+    ]
+    for horizon in report["horizons"]:
+        print_section(horizon["name"])
+        print(_horizon_meta(horizon))
+        print_table(headers, _horizon_rows(report, horizon["id"]))
 
     print_section("VRAM")
-    print_table(["Sweep", "Framework", "Pass", "Shape", "Status", "Peak"], _vram_rows(report["results"]))
+    for horizon in report["horizons"]:
+        print_section(f"{horizon['name']} VRAM")
+        print_table(["Shape", "Framework", "Status", "Peak", "Notes"], _vram_rows(report, horizon["id"]))
 
     print_section("Profiling")
-    print_table(["Sweep", "Framework", "Pass", "Shape", "AI", "GB/s", "Peak %", "Roofline"], _profiling_rows(report["results"]))
+    print_table(["Horizon", "Shape", "Framework", "AI", "GB/s", "Peak %", "Roofline"], _profiling_rows(report))
+
+    print_section("Path Coverage")
+    print_table(["Horizon", "Framework", "Shape Group", "Path"], _path_rows(report))
 
     print_section("Warnings")
     print_table(["Warning"], [[warning] for warning in report["warnings"]])
@@ -174,7 +260,6 @@ def markdown_report(report: dict) -> str:
     env = report["environment"]
     settings = report["settings"]
     parts = ["# RMSNorm Isolation Timing", ""]
-
     parts.extend(
         [
             "## Environment",
@@ -202,27 +287,53 @@ def markdown_report(report: dict) -> str:
                     ["Warmup", report["warmup"]],
                     ["Runs", report["runs"]],
                     ["Seed", settings["seed"]],
-                    ["Casting Mode", settings["casting_mode"]],
-                    ["Offset", settings["offset"]],
-                    ["Eps", settings["eps"]],
-                    ["Backward in_place", settings["backward_in_place"]],
+                    ["Steady State", "CUDA events after warmup/autotune"],
+                    ["Cold Start", "fresh subprocess with temporary Triton cache"],
                 ],
             ),
             "## Competitor Availability",
             _md_table(["Framework", "Status", "Notes"], _availability_rows(report["competitor_availability"])),
+            "## Capability Matrix",
+            _md_table(["Framework", "Horizon", "Status", "Expected", "Observed", "Reason"], _capability_rows(report)),
+            "## Fairness Exclusions",
+            _md_table(["Framework", "Horizon", "Status", "Reason", "Expected", "Observed"], _exclusion_rows(report)),
+            "## Folding Canary",
+            _md_table(
+                ["Status", "Max Abs"],
+                [[report.get("folding_canary", {}).get("status", "-"), format_float(report.get("folding_canary", {}).get("max_abs"))]],
+            ),
+            "## Cold Start / Autotune",
+            _md_table(["Horizon", "Framework", "Shape", "Status", "Elapsed ms", "Peak", "Notes"], _cold_start_rows(report)),
+            "## Steady-State Timing",
         ]
     )
+    headers = [
+        "Shape",
+        "Framework",
+        "Status",
+        "Median ms",
+        "P95 ms",
+        "vs PyTorch",
+        "vs Liger",
+        "GB/s",
+        "Peak %",
+        "Observed",
+        "Path",
+        "Notes",
+    ]
+    for horizon in report["horizons"]:
+        parts.extend([f"### {horizon['name']}", _horizon_meta(horizon), _md_table(headers, _horizon_rows(report, horizon["id"]))])
 
-    headers = ["Framework", "Pass", "Shape", "Status", "Median ms", "P95 ms", "GB/s", "Peak %", "Notes"]
-    for sweep, title in SWEEP_TITLES.items():
-        parts.extend([f"## {title}", _md_table(headers, _timing_rows(report["results"], sweep))])
+    parts.append("## VRAM")
+    for horizon in report["horizons"]:
+        parts.extend([f"### {horizon['name']} VRAM", _md_table(["Shape", "Framework", "Status", "Peak", "Notes"], _vram_rows(report, horizon["id"]))])
 
     parts.extend(
         [
-            "## VRAM",
-            _md_table(["Sweep", "Framework", "Pass", "Shape", "Status", "Peak"], _vram_rows(report["results"])),
             "## Profiling",
-            _md_table(["Sweep", "Framework", "Pass", "Shape", "AI", "GB/s", "Peak %", "Roofline"], _profiling_rows(report["results"])),
+            _md_table(["Horizon", "Shape", "Framework", "AI", "GB/s", "Peak %", "Roofline"], _profiling_rows(report)),
+            "## Path Coverage",
+            _md_table(["Horizon", "Framework", "Shape Group", "Path"], _path_rows(report)),
             "## Warnings",
             _md_table(["Warning"], [[warning] for warning in report["warnings"]]),
         ]
